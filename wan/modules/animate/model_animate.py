@@ -223,9 +223,21 @@ class WanAnimateAttentionBlock(nn.Module):
         assert npu_available or e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
-        )
+        if npu_available:
+            y = self.cache.apply(
+                self.self_attn,
+                self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
+                seq_lens,
+                grid_sizes,
+                freqs,
+                self.args,
+                rainfusion_config=None, #TODO
+                t_idx=None #TODO
+            )
+        else:
+            y = self.self_attn(
+                self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
+            )
         with amp.autocast(dtype=AUTOCAST_TORCH_DTYPE):
             x = x + y * e[2]
 
