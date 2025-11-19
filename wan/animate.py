@@ -108,7 +108,8 @@ class WanAnimate:
 
         self.vae = Wan2_1_VAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device=self.device,
+            dtype=self.param_dtype)
 
         logging.info(f"Creating WanAnimate from {checkpoint_dir}")
 
