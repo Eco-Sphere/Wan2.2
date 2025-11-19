@@ -21,4 +21,5 @@ torchrun --nnodes 1 --nproc_per_node 8 ../../generate.py \
     --refert_num 1 \
     --dit_fsdp \
     --t5_fsdp \
-    --ulysses_size 8
+    --ulysses_size 8 \
+    --vae_parallel
