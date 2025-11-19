@@ -646,62 +646,48 @@ def generate(args):
             use_relighting_lora=args.use_relighting_lora
         )
 
+        transformer = wan_animate.noise_model
+
         if args.use_rainfusion:
             if args.dit_fsdp:
-                transformer_low._fsdp_wrapped_module.rainfusion_config = rainfusion_config
-                transformer_high._fsdp_wrapped_module.rainfusion_config = rainfusion_config
+                transformer._fsdp_wrapped_module.rainfusion_config = rainfusion_config
             else:
-                transformer_low.rainfusion_config = rainfusion_config
-                transformer_high.rainfusion_config = rainfusion_config
+                transformer.rainfusion_config = rainfusion_config
         
         if args.tp_size > 1:
             logging.info("Initializing Tensor Parallel ...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
-            applicator.apply_to_model(transformer_low)
-            applicator.apply_to_model(transformer_high)
-        # wan_i2v.low_noise_model.to("npu")
-        # wan_i2v.high_noise_model.to("npu")
+            applicator.apply_to_model(transformer)
 
         if args.quant_mode == 2:
             logging.info(f"quantize weights saved, will be return")
             return
 
         if args.use_attentioncache:
-            config_low = CacheConfig(
+            config = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_low.blocks),
+                blocks_count=len(transformer.blocks),
                 steps_count=args.sample_steps,
                 step_start=args.start_step,
                 step_interval=args.attentioncache_interval,
                 step_end=args.end_step
             )
         else:
-            config_low = CacheConfig(
+            config = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_low.blocks),
+                blocks_count=len(transformer.blocks),
                 steps_count=args.sample_steps
             )
-        config_high = CacheConfig(
-            method="attention_cache",
-            blocks_count=len(transformer_high.blocks),
-            steps_count=args.sample_steps
-        )
-        cache_low = CacheAgent(config_low)
-        cache_high = CacheAgent(config_high)
+
+        cache = CacheAgent(config)
 
         if args.dit_fsdp:
-            for block in transformer_high._fsdp_wrapped_module.blocks:
-                block._fsdp_wrapped_module.cache = cache_high
+            for block in transformer._fsdp_wrapped_module.blocks:
+                block._fsdp_wrapped_module.cache = cache
                 block._fsdp_wrapped_module.args = args
-            for block in transformer_low._fsdp_wrapped_module.blocks:
-                block._fsdp_wrapped_module.cache = cache_low
-                block._fsdp_wrapped_module.args = args  
         else:
-            for block in transformer_high.blocks:
-                block.cache = cache_high
-                block.args = args
-            for block in transformer_low.blocks:
-                block.cache = cache_low
+            for block in transformer.blocks:
+                block.cache = cache
                 block.args = args
 
         logging.info("Warm up 2 steps ...")
