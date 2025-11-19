@@ -17,6 +17,13 @@ from ...distributed.sequence_parallel import (
     gather_forward,
     get_rank,
     get_world_size,
+    pad_freqs
+)
+
+from ...distributed.parallel_mgr import (
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_sp_group
 )
 
 
@@ -35,6 +42,12 @@ from ..model import (
 
 from .face_blocks import FaceEncoder, FaceAdapter
 from .motion_encoder import Generator
+
+try:
+    import torch_npu
+    npu_available=True
+except:
+    npu_available=False
 
 class HeadAnimate(Head):
 
@@ -337,6 +350,8 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             num_heads=4,
         )
 
+        self.freqs_list = None
+
     def after_patch_embedding(self, x: List[torch.Tensor], pose_latents, face_pixel_values):
         pose_latents = [self.pose_patch_embedding(u.unsqueeze(0)) for u in pose_latents]
         for x_, pose_latents_ in zip(x, pose_latents):
@@ -367,7 +382,39 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             residual_out = self.face_adapter.fuser_blocks[block_idx // 5](*adapter_args)
             x = residual_out + x
         return x
+        
+    def calculate_freqs_list(self, x, grid_sizes):
+        if self.freqs_list or not npu_available:
+            return
+        
+        c = (self.dim // self.num_heads) // 2
+        s = x.shape[1]
+        freqs = self.freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+        freqs_list = []
 
+        for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+            seq_len = f * h * w
+            freqs_i = torch.cat([
+                freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+                freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+                freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            ],
+                                dim=-1).reshape(seq_len, 1, -1)
+
+            if self.use_context_parallel:
+                # apply rotary embedding
+                sp_size = get_sequence_parallel_world_size()
+                sp_rank = get_sequence_parallel_rank()
+                freqs_i = pad_freqs(freqs_i, s * sp_size)
+                s_per_rank = s
+                freqs_i = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) * s_per_rank), :, :]
+            
+            cos, sin = torch.chunk(torch.view_as_real(freqs_i.to(torch.complex64)), 2, dim=-1)
+            cos = cos.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2)
+            sin = sin.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2)
+            freqs_i = (cos, sin)
+            freqs_list.append(freqs_i)
+        self.freqs_list = freqs_list
 
     def forward(
         self,
@@ -434,6 +481,10 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         if self.use_context_parallel:
             x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]
+
+        self.calculate_freqs_list(x, grid_sizes)
+        if self.freqs_list:
+            kwargs['freqs'] = self.freqs_list
 
         for idx, block in enumerate(self.blocks):
             x = block(x, **kwargs)
