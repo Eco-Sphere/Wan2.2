@@ -67,7 +67,17 @@ def attention(
     if mode == "torch":
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal)
+        q = q.transpose(2,1).contiguous()
+        k = k.transpose(2,1).contiguous()
+        k = k.transpose(2,1).contiguous()
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=drop_rate,
+            is_causal=causal,
+        )
 
     elif mode == "flash":
         x = flash_attn_func(
