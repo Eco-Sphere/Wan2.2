@@ -643,7 +643,8 @@ def generate(args):
             use_sp=(args.ulysses_size > 1),
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
-            use_relighting_lora=args.use_relighting_lora
+            use_relighting_lora=args.use_relighting_lora,
+            use_vae_parallel=args.vae_parallel
         )
 
         transformer = wan_animate.noise_model

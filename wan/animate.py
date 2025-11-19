@@ -30,7 +30,7 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-
+from .vae_patch_parallel import VAE_patch_parallel, set_vae_patch_parallel
 
 
 class WanAnimate:
@@ -47,7 +47,8 @@ class WanAnimate:
         t5_cpu=False,
         init_on_cpu=True,
         convert_model_dtype=False,
-        use_relighting_lora=False
+        use_relighting_lora=False,
+        use_vae_parallel=False,
     ):
         r"""
         Initializes the generation model components.
@@ -110,6 +111,18 @@ class WanAnimate:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device,
             dtype=self.param_dtype)
+
+        if use_vae_parallel:
+            all_pp_group_ranks = []
+            if dist.get_world_size() < 8 :
+                all_pp_group_ranks.append(list(range(0, dist.get_world_size())))
+                set_vae_patch_parallel(self.vae.model, dist.get_world_size(), 1, all_pp_group_ranks= all_pp_group_ranks, decoder_decode="decoder.forward")
+                set_vae_patch_parallel(self.vae.model, dist.get_world_size(), 1, all_pp_group_ranks= all_pp_group_ranks, decoder_decode="encoder.forward")
+            else:
+                for i in range(0, dist.get_world_size() // 8):
+                    all_pp_group_ranks.append(list(range(8 * i, 8 * (i + 1))))
+                set_vae_patch_parallel(self.vae.model, 4, 2, all_pp_group_ranks= all_pp_group_ranks, decoder_decode="decoder.forward")
+                set_vae_patch_parallel(self.vae.model, 4, 2, all_pp_group_ranks= all_pp_group_ranks, decoder_decode="encoder.forward")
 
         logging.info(f"Creating WanAnimate from {checkpoint_dir}")
 
@@ -506,12 +519,14 @@ class WanAnimate:
 
                 latents = noise
 
-                pose_latents_no_ref =  self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
+                with VAE_patch_parallel():
+                    pose_latents_no_ref = self.vae.encode(conditioning_pixel_values.to(torch.bfloat16))
                 pose_latents_no_ref = torch.stack(pose_latents_no_ref)
                 pose_latents = torch.cat([pose_latents_no_ref], dim=2)
 
                 ref_pixel_values = rearrange(ref_pixel_values, "t c h w -> 1 c t h w")
-                ref_latents =  self.vae.encode(ref_pixel_values.to(torch.bfloat16))
+                with VAE_patch_parallel():
+                    ref_latents =  self.vae.encode(ref_pixel_values.to(torch.bfloat16))
                 ref_latents = torch.stack(ref_latents)
 
                 mask_ref = self.get_i2v_mask(1, lat_h, lat_w, 1, device=self.device)
@@ -523,29 +538,33 @@ class WanAnimate:
                 if mask_reft_len > 0:
                     if replace_flag:
                         bg_pixel_values = batch["bg_pixel_values"]
-                        y_reft = self.vae.encode(
-                            [
-                                torch.concat([refer_t_pixel_values[0, :, :mask_reft_len], bg_pixel_values[0, :, mask_reft_len:]], dim=1).to(self.device)
-                            ]
-                        )[0]
+                        encode_input = torch.concat([refer_t_pixel_values[0, :, :mask_reft_len], bg_pixel_values[0, :, mask_reft_len:]], dim=1).to(self.device)
+                        with VAE_patch_parallel():
+                            y_reft = self.vae.encode(
+                                [
+                                    encode_input
+                                ]
+                            )[0]
                         mask_pixel_values = 1 - batch["mask_pixel_values"]
                         mask_pixel_values = rearrange(mask_pixel_values, "b t c h w -> (b t) c h w")
                         mask_pixel_values = F.interpolate(mask_pixel_values, size=(H//8, W//8), mode='nearest')
                         mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
                         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, mask_reft_len, mask_pixel_values=mask_pixel_values, device=self.device)
                     else:
-                        y_reft = self.vae.encode(
-                            [
-                                torch.concat(
-                                    [
-                                        torch.nn.functional.interpolate(refer_t_pixel_values[0, :, :mask_reft_len].cpu(),
-                                                                        size=(H, W), mode="bicubic"),
-                                        torch.zeros(3, T - mask_reft_len, H, W),
-                                    ],
-                                    dim=1,
-                                ).to(self.device)
-                            ]
-                        )[0]
+                        encode_input = torch.concat(
+                                        [
+                                            torch.nn.functional.interpolate(refer_t_pixel_values[0, :, :mask_reft_len].cpu(),
+                                                                            size=(H, W), mode="bicubic"),
+                                            torch.zeros(3, T - mask_reft_len, H, W),
+                                        ],
+                                        dim=1,
+                                    ).to(self.device)
+                        with VAE_patch_parallel():
+                            y_reft = self.vae.encode(
+                                [
+                                    encode_input
+                                ]
+                            )[0]
                         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, mask_reft_len, device=self.device)
                 else:
                     if replace_flag:
@@ -554,28 +573,35 @@ class WanAnimate:
                         mask_pixel_values = rearrange(mask_pixel_values, "b t c h w -> (b t) c h w")
                         mask_pixel_values = F.interpolate(mask_pixel_values, size=(H//8, W//8), mode='nearest')
                         mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
-                        y_reft = self.vae.encode(
-                            [
-                                torch.concat(
+                        
+                        encode_input = torch.concat(
                                     [
                                         bg_pixel_values[0],
                                     ],
                                     dim=1,
                                 ).to(self.device)
-                            ]
-                        )[0]
+                        
+                        with VAE_patch_parallel():
+                            y_reft = self.vae.encode(
+                                [
+                                    encode_input
+                                ]
+                            )[0]
                         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, mask_reft_len, mask_pixel_values=mask_pixel_values, device=self.device)
                     else:
-                        y_reft = self.vae.encode(
-                            [
-                                torch.concat(
+                        encode_input = torch.concat(
                                     [
                                         torch.zeros(3, T - mask_reft_len, H, W),
                                     ],
                                     dim=1,
                                 ).to(self.device)
-                            ]
-                        )[0]
+
+                        with VAE_patch_parallel():
+                            y_reft = self.vae.encode(
+                                [
+                                    encode_input
+                                ]
+                            )[0]
                         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, mask_reft_len, device=self.device)
 
                 y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=self.device)
@@ -635,7 +661,11 @@ class WanAnimate:
                     x0 = latents
 
                 x0 = [x.to(dtype=torch.float32) for x in x0]
-                out_frames = torch.stack(self.vae.decode([x0[0][:, 1:]]))
+
+                if self.rank < 8:
+                    with VAE_patch_parallel():
+                        videos = self.vae.decode([x0[0][:, 1:]])
+                out_frames = torch.stack(videos)
                 
                 if start != 0:
                     out_frames = out_frames[:, :, refert_num:]
