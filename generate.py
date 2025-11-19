@@ -705,6 +705,7 @@ def generate(args):
             offload_model=args.offload_model)
 
         logging.info(f"Generating video ...")
+        begin = time.time()
         video = wan_animate.generate(
             src_root_path=args.src_root_path,
             replace_flag=args.replace_flag,
@@ -716,6 +717,8 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+        end = time.time()
+        logging.info(f"Generating video used time {end - begin: .4f}s")
     else:
         logging.info("Creating WanI2V pipeline.")
         wan_i2v = wan.WanI2V(
