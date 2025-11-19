@@ -3,6 +3,16 @@ import os
 import argparse
 from process_pipepline import ProcessPipeline
 
+try:
+    import torch
+    import torch_npu
+    torch_npu.npu.set_compile_mode(jit_compile=False)
+    torch.npu.config.allow_internal_format=False
+    from torch_npu.contrib import transfer_to_npu
+    npu_available = True
+except:
+    npu_available = False
+
 
 def _parse_args():
     parser = argparse.ArgumentParser(

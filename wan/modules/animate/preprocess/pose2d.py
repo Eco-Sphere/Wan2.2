@@ -7,6 +7,14 @@ import numpy as np
 import torch
 import onnxruntime
 
+try:
+    import torch_npu
+    npu_available=True
+    ONNX_PROVIDERS="CANNExecutionProvider"
+except:
+    npu_available=False
+    ONNX_PROVIDERS="CUDAExecutionProvider"
+
 from pose2d_utils import (
     read_img,
     box_convert_simple,
@@ -21,11 +29,12 @@ class SimpleOnnxInference(object):
     def __init__(self, checkpoint, device='cuda', reverse_input=False, **kwargs):
         if isinstance(device, str):
             device = torch.device(device)
-        if device.type == 'cuda':
+        if device.type == 'cuda' or npu_available:
             device = '{}:{}'.format(device.type, device.index)
-            providers = [("CUDAExecutionProvider", {"device_id": device[-1:] if device[-1] in [str(_i) for _i in range(10)] else "0"}), "CPUExecutionProvider"]
+            providers = [(ONNX_PROVIDERS, {"device_id": device[-1:] if device[-1] in [str(_i) for _i in range(10)] else "0"}), "CPUExecutionProvider"]
         else:
             providers = ["CPUExecutionProvider"]
+        providers = ["CPUExecutionProvider"]
         self.device = device
         if not os.path.exists(checkpoint):
             raise RuntimeError("{} is not existed!".format(checkpoint))
