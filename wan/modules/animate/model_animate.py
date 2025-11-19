@@ -48,6 +48,8 @@ try:
 except:
     npu_available=False
 
+AUTOCAST_TORCH_DTYPE = torch.bfloat16 if npu_available else torch.float32
+
 class HeadAnimate(Head):
 
     def forward(self, x, e):
@@ -56,8 +58,8 @@ class HeadAnimate(Head):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, L1, C]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        assert npu_available or e.dtype == torch.float32
+        with amp.autocast(dtype=AUTOCAST_TORCH_DTYPE):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
@@ -215,23 +217,23 @@ class WanAnimateAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast(dtype=torch.float32):
+        assert npu_available or e.dtype == torch.float32
+        with amp.autocast(dtype=AUTOCAST_TORCH_DTYPE):
             e = (self.modulation + e).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        assert npu_available or e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes, freqs
         )
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast(dtype=AUTOCAST_TORCH_DTYPE):
             x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
-            with amp.autocast(dtype=torch.float32):
+            with amp.autocast(dtype=AUTOCAST_TORCH_DTYPE):
                 x = x + y * e[5]
             return x
 
@@ -449,12 +451,12 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         ])
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast(dtype=AUTOCAST_TORCH_DTYPE):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float()
             )
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+            assert npu_available or (e.dtype == torch.float32 and e0.dtype == torch.float32)
 
         # context
         context_lens = None
