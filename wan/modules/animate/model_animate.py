@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import logging
 import math
 import types
 from copy import deepcopy
@@ -11,6 +12,8 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import PeftAdapterMixin
+
+from wan.utils.rainfusion import Rainfusion
 
 from ...distributed.sequence_parallel import (
     gather_forward,
@@ -208,6 +211,8 @@ class WanAnimateAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        rainfusion_config,
+        t_idx,
     ):
         """
         Args:
@@ -231,8 +236,8 @@ class WanAnimateAttentionBlock(nn.Module):
                 grid_sizes,
                 freqs,
                 self.args,
-                rainfusion_config=None, #TODO
-                t_idx=None #TODO
+                rainfusion_config=rainfusion_config,
+                t_idx=t_idx
             )
         else:
             y = self.self_attn(
@@ -364,6 +369,7 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         )
 
         self.freqs_list = None
+        self.rainfusion_config = None
 
     def after_patch_embedding(self, x: List[torch.Tensor], pose_latents, face_pixel_values):
         pose_latents = [self.pose_patch_embedding(u.unsqueeze(0)) for u in pose_latents]
@@ -438,8 +444,17 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         seq_len,
         y=None,
         pose_latents=None, 
-        face_pixel_values=None
+        face_pixel_values=None,
+        t_idx=None
     ):
+        # Rainfusion Config Initialization
+        if self.rainfusion_config and self.rainfusion_config["atten_mask_all"] is None:
+            self.rainfusion_config["grid_size"] = Rainfusion.get_grid_size(x[0].shape, self.patch_size)
+            logging.info(f"Rainfusion grid size: {self.rainfusion_config['grid_size']}")
+            self.rainfusion_config["atten_mask_all"] = Rainfusion.get_atten_mask(
+                grid_size=self.rainfusion_config["grid_size"],
+                sparsity=self.rainfusion_config["sparsity"]
+            )
         # params
         device = self.patch_embedding.weight.device
         if self.freqs.device != device:
@@ -490,7 +505,10 @@ class WanAnimateModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            rainfusion_config=self.rainfusion_config,
+            t_idx=t_idx
+        )
 
         if self.use_context_parallel:
             x = torch.chunk(x, get_world_size(), dim=1)[get_rank()]

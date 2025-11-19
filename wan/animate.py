@@ -634,13 +634,13 @@ class WanAnimate:
                     timestep = torch.stack(timestep)
 
                     noise_pred_cond = TensorList(
-                         self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c)
+                         self.noise_model(TensorList(latent_model_input), t=timestep, **arg_c, t_idx=i)
                     )
 
                     if guide_scale > 1:
                         noise_pred_uncond = TensorList(
                              self.noise_model(
-                                TensorList(latent_model_input), t=timestep, **arg_null
+                                TensorList(latent_model_input), t=timestep, **arg_null, t_idx=i
                             )
                         )
                         noise_pred = noise_pred_uncond + guide_scale * (
