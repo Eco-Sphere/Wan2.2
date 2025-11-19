@@ -27,7 +27,7 @@ from ..model import (
     WanRMSNorm,
     WanModel,
     WanSelfAttention,
-    flash_attention,
+    attention,
     rope_params,
     sinusoidal_embedding_1d,
     rope_apply
@@ -72,7 +72,7 @@ class WanAnimateSelfAttention(WanSelfAttention):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
+        x = attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
@@ -131,9 +131,9 @@ class WanAnimateCrossAttention(WanSelfAttention):
         if self.use_img_emb:
             k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
             v_img = self.v_img(context_img).view(b, -1, n, d)
-            img_x = flash_attention(q, k_img, v_img, k_lens=None)
+            img_x = attention(q, k_img, v_img, k_lens=None)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
