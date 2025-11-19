@@ -674,6 +674,17 @@ class WanAnimate:
 
                 start += clip_len - refert_num
                 end += clip_len - refert_num
+        
+        del noise_pred
+        del sample_scheduler
+        del videos
+
+        def unwrap_fsdp(model):
+            if hasattr(model, '_fsdp_wrapped_module'):
+                return model._fsdp_wrapped_module
+            return model
+        unwrap_fsdp(self.noise_model).freqs_list = None
+        
 
         videos = torch.cat(all_out_frames, dim=2)[:, :, :real_frame_len]
         return videos[0] if self.rank == 0 else None
