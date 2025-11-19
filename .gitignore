@@ -3,6 +3,7 @@
 *.json
 *.out
 *.om
+*.mp4
 
 kernel_meta/
 results/

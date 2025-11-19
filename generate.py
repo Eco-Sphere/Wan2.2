@@ -644,7 +644,9 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             use_relighting_lora=args.use_relighting_lora,
-            use_vae_parallel=args.vae_parallel
+            use_vae_parallel=args.vae_parallel,
+            quant_mode=args.quant_mode,
+            quant_data_dir=args.quant_data_dir,
         )
 
         transformer = wan_animate.noise_model

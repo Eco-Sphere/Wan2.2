@@ -49,6 +49,8 @@ class WanAnimate:
         convert_model_dtype=False,
         use_relighting_lora=False,
         use_vae_parallel=False,
+        quant_mode=0,
+        quant_data_dir="./quant_data_dir"
     ):
         r"""
         Initializes the generation model components.
@@ -86,6 +88,8 @@ class WanAnimate:
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
+
+        self.quant_mode = quant_mode
 
         if t5_fsdp or dit_fsdp or use_sp:
             self.init_on_cpu = False
@@ -126,15 +130,32 @@ class WanAnimate:
 
         logging.info(f"Creating WanAnimate from {checkpoint_dir}")
 
-        if not dit_fsdp:
-            self.noise_model = WanAnimateModel.from_pretrained(
-                checkpoint_dir,
-                torch_dtype=self.param_dtype,
-                device_map=self.device)
-        else:
-            self.noise_model = WanAnimateModel.from_pretrained(
-                checkpoint_dir, torch_dtype=self.param_dtype)
+        self.noise_model = WanAnimateModel.from_pretrained(checkpoint_dir, torch_dtype=self.param_dtype)
 
+        if quant_mode == 2:
+            from quant.quant import quantize_weight
+
+            self.noise_model.to(self.device)
+
+            if use_relighting_lora:
+                self.load_lora(self.noise_model, checkpoint_dir, self.config)
+
+            quant_data_dir = os.path.join(quant_data_dir, "animate_quant_weights_anti")
+            quantize_weight(self.noise_model, quant_data_dir)
+            logging.info(f"quantize weights saved in {quant_data_dir}")
+            return
+
+        elif quant_mode == 3:
+            from mindiesd import quantize
+
+            quant_data_dir = os.path.join(quant_data_dir, "animate_quant_weights_anti")
+            logging.info("use quant!")
+            torch.npu.config.allow_internal_format = True
+            quantize(self.noise_model, os.path.join(quant_data_dir, "quant_model_description_w8a8_dynamic.json"),
+                  use_nz=False)
+            torch.npu.config.allow_internal_format = False
+            self.noise_model = self.noise_model.to(self.device)
+        
         self.noise_model = self._configure_model(
             model=self.noise_model,
             use_sp=use_sp,
@@ -154,6 +175,18 @@ class WanAnimate:
         self.sample_neg_prompt = config.sample_neg_prompt
         self.sample_prompt = config.prompt
 
+    def load_lora(self, model, checkpoint_dir, config):
+        logging.info("Loading Relighting Lora. ")
+        lora_config = get_loraconfig(
+            transformer=model,
+            rank=128,
+            alpha=128
+        )
+        model.add_adapter(lora_config)
+        lora_path = os.path.join(checkpoint_dir, config.lora_checkpoint)
+        peft_state_dict = torch.load(lora_path)["state_dict"]
+        set_peft_model_state_dict(model, peft_state_dict)
+        logging.info("Finish loading Relighting Lora. ")
 
     def _configure_model(self, model, use_sp, dit_fsdp, shard_fn,
                          convert_model_dtype, use_lora, checkpoint_dir, config):
@@ -190,17 +223,8 @@ class WanAnimate:
         if dist.is_initialized():
             dist.barrier()
 
-        if use_lora:
-            logging.info("Loading Relighting Lora. ")
-            lora_config = get_loraconfig(
-                transformer=model,
-                rank=128,
-                alpha=128
-            )
-            model.add_adapter(lora_config)
-            lora_path = os.path.join(checkpoint_dir, config.lora_checkpoint)
-            peft_state_dict = torch.load(lora_path)["state_dict"]
-            set_peft_model_state_dict(model, peft_state_dict)
+        if use_lora and not self.quant_mode == 3:
+            self.load_lora(model, checkpoint_dir, config)
 
         if dit_fsdp:
             model = shard_fn(model, use_lora=use_lora)
