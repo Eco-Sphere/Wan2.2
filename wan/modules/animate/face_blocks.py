@@ -7,6 +7,11 @@ import torch.nn.functional as F
 import math
 from ...distributed.util import gather_forward, get_rank, get_world_size
 
+try:
+    import torch_npu
+    npu_available=True
+except:
+    npu_available=False
 
 try:
     from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
@@ -131,7 +136,11 @@ class CausalConv1d(nn.Module):
         self.conv = nn.Conv1d(chan_in, chan_out, kernel_size, stride=stride, dilation=dilation, **kwargs)
 
     def forward(self, x):
-        x = F.pad(x, self.time_causal_padding, mode=self.pad_mode)
+        if npu_available:
+            ori_type = x.dtype
+            x = F.pad(x.to(torch.float32), self.time_causal_padding, mode=self.pad_mode).to(ori_type)
+        else:
+            x = F.pad(x, self.time_causal_padding, mode=self.pad_mode)
         return self.conv(x)
 
 
@@ -377,6 +386,7 @@ class FaceBlock(nn.Module):
             q,
             k,
             v,
+            mode="torch" if npu_available else "flash",
             max_seqlen_q=q.shape[1],
             batch_size=q.shape[0],
         )
