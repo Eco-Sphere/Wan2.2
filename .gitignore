@@ -1,1 +1,8 @@
 *.pyc
+*.log
+*.json
+*.out
+*.om
+
+kernel_meta/
+results/
