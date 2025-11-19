@@ -13,7 +13,6 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import PeftAdapterMixin
 
 from ...distributed.sequence_parallel import (
-    distributed_attention,
     gather_forward,
     get_rank,
     get_world_size,
