@@ -74,7 +74,7 @@ def attention(
             attn_mask = attn_mask.to(q.dtype)
         q = q.transpose(2,1).contiguous()
         k = k.transpose(2,1).contiguous()
-        k = k.transpose(2,1).contiguous()
+        v = v.transpose(2,1).contiguous()
         x = F.scaled_dot_product_attention(
             q,
             k,
