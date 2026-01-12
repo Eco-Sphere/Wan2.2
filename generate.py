@@ -45,6 +45,12 @@ EXAMPLE_PROMPT = {
         "prompt":
             "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage.",
     },
+    "animate-14B": {
+        "prompt": "视频中的人在做动作",
+        "video": "",
+        "pose": "",
+        "mask": "",
+    },
 }
 
 
@@ -240,6 +246,7 @@ def _parse_args():
         default="./output/quant_data",
         help="Path for calibration data or weight export.")
 
+    parser = add_animate_args(parser)
     parser = add_attentioncache_args(parser)
     parser = add_rainfusion_args(parser)
     args = parser.parse_args()
@@ -248,6 +255,31 @@ def _parse_args():
 
     return args
 
+def add_animate_args(parser: argparse.ArgumentParser):
+    group = parser.add_argument_group(title="Animate args")
+    # animate
+    group.add_argument(
+        "--src_root_path",
+        type=str,
+        default=None,
+        help="The file of the process output path. Default None.")
+    group.add_argument(
+        "--refert_num",
+        type=int,
+        default=77,
+        help="How many frames used for temporal guidance. Recommended to be 1 or 5."
+    )
+    group.add_argument(
+        "--replace_flag",
+        action="store_true",
+        default=False,
+        help="Whether to use replace.")
+    group.add_argument(
+        "--use_relighting_lora",
+        action="store_true",
+        default=False,
+        help="Whether to use relighting lora.")
+    return parser
 
 def add_attentioncache_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group(title="Attention Cache args")
@@ -597,6 +629,96 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model)
         stream.synchronize()
+        end = time.time()
+        logging.info(f"Generating video used time {end - begin: .4f}s")
+    elif "animate" in args.task:
+        logging.info("Creating Wan-Animate pipeline.")
+        wan_animate = wan.WanAnimate(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp,
+            use_sp=(args.ulysses_size > 1),
+            t5_cpu=args.t5_cpu,
+            convert_model_dtype=args.convert_model_dtype,
+            use_relighting_lora=args.use_relighting_lora,
+            use_vae_parallel=args.vae_parallel,
+            quant_mode=args.quant_mode,
+            quant_data_dir=args.quant_data_dir,
+        )
+
+        transformer = wan_animate.noise_model
+
+        if args.use_rainfusion:
+            if args.dit_fsdp:
+                transformer._fsdp_wrapped_module.rainfusion_config = rainfusion_config
+            else:
+                transformer.rainfusion_config = rainfusion_config
+        
+        if args.tp_size > 1:
+            logging.info("Initializing Tensor Parallel ...")
+            applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
+            applicator.apply_to_model(transformer)
+
+        if args.quant_mode == 2:
+            logging.info(f"quantize weights saved, will be return")
+            return
+
+        if args.use_attentioncache:
+            config = CacheConfig(
+                method="attention_cache",
+                blocks_count=len(transformer.blocks),
+                steps_count=args.sample_steps,
+                step_start=args.start_step,
+                step_interval=args.attentioncache_interval,
+                step_end=args.end_step
+            )
+        else:
+            config = CacheConfig(
+                method="attention_cache",
+                blocks_count=len(transformer.blocks),
+                steps_count=args.sample_steps
+            )
+
+        cache = CacheAgent(config)
+
+        if args.dit_fsdp:
+            for block in transformer._fsdp_wrapped_module.blocks:
+                block._fsdp_wrapped_module.cache = cache
+                block._fsdp_wrapped_module.args = args
+        else:
+            for block in transformer.blocks:
+                block.cache = cache
+                block.args = args
+
+        logging.info("Warm up 2 steps ...")
+        video = wan_animate.generate(
+            src_root_path=args.src_root_path,
+            replace_flag=args.replace_flag,
+            refert_num = args.refert_num,
+            clip_len=args.frame_num,
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=2,
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model)
+
+        logging.info(f"Generating video ...")
+        begin = time.time()
+        video = wan_animate.generate(
+            src_root_path=args.src_root_path,
+            replace_flag=args.replace_flag,
+            refert_num = args.refert_num,
+            clip_len=args.frame_num,
+            shift=args.sample_shift,
+            sample_solver=args.sample_solver,
+            sampling_steps=args.sample_steps,
+            guide_scale=args.sample_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model)
         end = time.time()
         logging.info(f"Generating video used time {end - begin: .4f}s")
     else:

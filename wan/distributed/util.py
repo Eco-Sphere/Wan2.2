@@ -4,6 +4,16 @@ import logging
 import torch
 import torch.distributed as dist
 
+try:
+    from .parallel_mgr import (
+        get_sequence_parallel_rank,
+        get_sequence_parallel_world_size,
+        get_sp_group,
+    )
+    import torch_npu
+    npu_available = True
+except:
+    npu_available = False
 
 def generate_masked_orthogonal_rank_groups(
     world_size: int, parallel_size: List[int], mask: List[bool]
@@ -199,5 +209,8 @@ def gather_forward(input, dim):
         return input
 
     # gather sequence
-    output = all_gather(input)
+    if npu_available:
+        output = get_sp_group().all_gather(x, dim=1)
+    else:
+        output = all_gather(input)
     return torch.cat(output, dim=dim).contiguous()
