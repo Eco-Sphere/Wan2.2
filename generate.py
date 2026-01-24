@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 from datetime import datetime
+from typing import List, Optional
 
 warnings.filterwarnings('ignore')
 
@@ -21,7 +22,7 @@ import torch.distributed as dist
 from PIL import Image
 
 import wan
-from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
+from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS, OPTIMAL_PARALLEL
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import save_video, str2bool
@@ -66,22 +67,43 @@ def _validate_args(args):
 
     if args.sample_steps is None:
         args.sample_steps = cfg.sample_steps
+    else:
+        assert args.sample_steps >= 1 , f"sample_steps should be >= 1, but get {args.sample_steps}"
 
     if args.sample_shift is None:
         args.sample_shift = cfg.sample_shift
+    else:
+        assert args.sample_shift > 0.0 , f"sample_shift should be > 0, but get {args.sample_shift}"
 
     if args.sample_guide_scale is None:
         args.sample_guide_scale = cfg.sample_guide_scale
+    else:
+        assert args.sample_guide_scale > 0.0 , f"sample_guide_scale should be > 0, but get {args.sample_guide_scale}"
 
     if args.frame_num is None:
         args.frame_num = cfg.frame_num
+    else:
+        assert args.frame_num > 1 and(args.frame_num - 1) % 4 == 0, f"frame_num should be 4n+1 (n>0), but get {args.frame_num}"
 
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
+
     # Size check
-    assert args.size in SUPPORTED_SIZES[
-        args.
-        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+    assert args.size in SUPPORTED_SIZES[args.task], \
+        f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+
+    if args.cfg_size < 1 or args.ulysses_size < 1 or args.ring_size < 1 or args.tp_size < 1:
+        raise ValueError(f"cfg_size, ulysses_size, ring_size and tp_size must >= 1, \
+                         but get cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}, ring_size={args.ring_size}, tp_size={args.tp_size}")
+
+    if args.tp_size > 1:
+        raise NotImplementedError("Tensor Parallel is not supported now")
+
+    if args.use_attentioncache:
+        if "ti2v" not in args.task:
+            raise NotImplementedError(f"{args.task} unsupport attentioncache now")
+        assert args.start_step < args.sample_steps - 1, \
+            "start_step must be less than sample_steps - 1"
 
 
 def _parse_args():
@@ -224,21 +246,9 @@ def _parse_args():
         default=False,
         help="Whether to convert model paramerters dtype.")
     parser.add_argument(
-        "--quant_mode",
-        type=int,
-        default=0,
-        choices=[0, 1, 2, 3],
-        help="Quantization mode: " \
-        "0: Do not use quantized model for inference, " \
-        "1: Export calibration data, " \
-        "2: Export quantized model, " \
-        "3: Use quantized model for inference.")
-
-    parser.add_argument(
-        "--quant_data_dir",
+        "--quant_dit_path",
         type=str,
-        default="./output/quant_data",
-        help="Path for calibration data or weight export.")
+        help="Path to quantize dit model path, enable quantization if provided")
 
     parser = add_attentioncache_args(parser)
     parser = add_rainfusion_args(parser)
@@ -283,6 +293,50 @@ def _init_logging(rank):
         logging.basicConfig(level=logging.ERROR)
 
 
+def patch_cast_buffers_for_float8():
+    """
+    Patch FSDP buffer conversion functions for float8 quantization scenarios
+    """
+    try:
+        import torch.distributed.fsdp._runtime_utils as runtime_utils
+
+        original_func = runtime_utils._cast_buffers_to_dtype_and_device
+
+        def float8_aware_cast_buffers(
+            buffers: List[torch.Tensor],
+            buffer_dtypes: List[Optional[torch.dtype]],
+            device: torch.device,
+        ) -> None:
+            assert buffer_dtypes is None or len(buffers) == len(buffer_dtypes), \
+                f"Expects `buffers` and `buffer_dtypes` to have the same length if " \
+                f"`buffer_dtypes` is specified but got {len(buffers)} and " \
+                f"{len(buffer_dtypes)}"
+
+            SPECIAL_DTYPES = {
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            }
+
+            for buffer, buffer_dtype in zip(buffers, buffer_dtypes):
+                is_special_dtype = buffer.dtype in SPECIAL_DTYPES
+
+                if not torch.is_floating_point(buffer) or buffer_dtype is None or is_special_dtype:
+                    buffer.data = buffer.to(device=device)
+                else:
+                    buffer.data = buffer.to(device=device, dtype=buffer_dtype)
+
+        runtime_utils._cast_buffers_to_dtype_and_device = float8_aware_cast_buffers
+
+        return original_func
+
+    except ImportError:
+        print("Warning: Could not import torch.distributed.fsdp._runtime_utils")
+        return None
+    except Exception as e:
+        print(f"Warning: Failed to patch FSDP function: {e}")
+        return None
+
+
 def generate(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
@@ -312,14 +366,14 @@ def generate(args):
         assert not (
             args.vae_parallel
         ), f"vae parallel are not supported in non-distributed environments."
-    
-    if args.tp_size > 1:
-        raise NotImplementedError("Tensor Parallel is not supported now")
-    if "ti2v" not in args.task and args.use_attentioncache:
-        raise NotImplementedError(f"{args.task} unsupport attentioncache now")
+
+    assert args.cfg_size * args.ulysses_size * args.ring_size * args.tp_size == world_size, \
+            f"cfg_size {args.cfg_size} * ulysses_size {args.ulysses_size} * ring_size {args.ring_size} * tp_size {args.tp_size} should be equal to the world size {world_size}."
 
     if args.cfg_size > 1 or args.ulysses_size > 1 or args.ring_size > 1 or args.tp_size > 1:
-        assert args.cfg_size * args.ulysses_size * args.ring_size * args.tp_size == world_size, f"The number of cfg_size, ulysses_size, ring_size and tp_size should be equal to the world size."
+        if tuple([args.cfg_size, args.ulysses_size, args.ring_size]) not in OPTIMAL_PARALLEL:
+            logging.info(
+                f"cfg_size = {args.cfg_size}, ulysses_size = {args.ulysses_size}, ring_size = {args.ring_size}, Without the optimal parallel configuration, the model may either fail to run or yield suboptimal generation performance!!")
         sp_degree = args.ulysses_size * args.ring_size
         parallel_config = ParallelConfig(
             sp_degree=sp_degree,
@@ -331,9 +385,17 @@ def generate(args):
         )
         init_parallel_env(parallel_config)
 
+    if args.vae_parallel:
+        assert dist.is_initialized() and world_size > 1, "VAE Parallel only supports multi-card environment."
+        is_power_of_2 = (world_size & (world_size - 1)) == 0
+        assert is_power_of_2, "VAE Parallel only supports card number equal to powers of two."
+
     if args.tp_size > 1 and args.dit_fsdp:
         logging.info("DiT using Tensor Parallel, disabled dit_fsdp")
         args.dit_fsdp = False
+
+    if args.quant_dit_path and args.dit_fsdp:
+        patch_cast_buffers_for_float8()
 
     if args.use_prompt_extend:
         if args.prompt_extend_method == "dashscope":
@@ -405,7 +467,6 @@ def generate(args):
         wan_t2v = wan.WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            quant_data_dir=args.quant_data_dir,
             device_id=device,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
@@ -414,7 +475,7 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             use_vae_parallel=args.vae_parallel,
-            quant_mode=args.quant_mode
+            quant_dit_path=args.quant_dit_path
         )
 
         transformer_low = wan_t2v.low_noise_model
@@ -433,17 +494,13 @@ def generate(args):
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
             applicator.apply_to_model(transformer_low)
             applicator.apply_to_model(transformer_high)
-        # wan_t2v.low_noise_model.to("npu")
-        # wan_t2v.high_noise_model.to("npu")
-
-        if args.quant_mode == 2:
-            logging.info(f"quantize weights saved, will be return")
-            return
+        wan_t2v.low_noise_model.to("npu")
+        wan_t2v.high_noise_model.to("npu")
 
         if args.use_attentioncache:
             config_high = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_high.blocks),
+                blocks_count=len(transformer_high.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps,
                 step_start=args.start_step,
                 step_interval=args.attentioncache_interval,
@@ -452,12 +509,12 @@ def generate(args):
         else:
             config_high = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_high.blocks),
+                blocks_count=len(transformer_high.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         config_low = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_low.blocks),
+                blocks_count=len(transformer_low.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         cache_high = CacheAgent(config_high)
@@ -512,7 +569,6 @@ def generate(args):
         wan_ti2v = wan.WanTI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            quant_data_dir=args.quant_data_dir,
             device_id=device,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
@@ -521,40 +577,26 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             use_vae_parallel=args.vae_parallel,
-            quant_mode=args.quant_mode
+            quant_dit_path=args.quant_dit_path
         )
 
         transformer = wan_ti2v.model
-        
+
         if args.use_rainfusion:
             if args.dit_fsdp:
                 transformer._fsdp_wrapped_module.rainfusion_config = rainfusion_config
             else:
                 transformer.rainfusion_config = rainfusion_config
-        
+
         if args.tp_size > 1:
             logging.info("Initializing Tensor Parallel ...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
             applicator.apply_to_model(transformer)
-        # wan_ti2v.model.to("npu")
-        
-        if args.quant_mode == 2:
-            logging.info(f"quantize weights saved, will be return")
-            return
-        
-        if args.use_attentioncache:
-            config = CacheConfig(
+        wan_ti2v.model.to("npu")
+
+        config = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer.blocks),
-                steps_count=args.sample_steps,
-                step_start=args.start_step,
-                step_interval=args.attentioncache_interval,
-                step_end=args.end_step
-            )
-        else:
-            config = CacheConfig(
-                method="attention_cache",
-                blocks_count=len(transformer.blocks),
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         cache = CacheAgent(config)
@@ -581,6 +623,25 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model)
 
+        if args.use_attentioncache:
+            config = CacheConfig(
+                method="attention_cache",
+                blocks_count=len(transformer.blocks) * 2 // args.cfg_size,
+                steps_count=args.sample_steps,
+                step_start=args.start_step,
+                step_interval=args.attentioncache_interval,
+                step_end=args.end_step
+            )
+            cache = CacheAgent(config)
+            if args.dit_fsdp:
+                for block in transformer._fsdp_wrapped_module.blocks:
+                    block._fsdp_wrapped_module.cache = cache
+                    block._fsdp_wrapped_module.args = args
+            else:
+                for block in transformer.blocks:
+                    block.cache = cache
+                    block.args = args
+
         logging.info(f"Generating video ...")
         stream.synchronize()
         begin = time.time()
@@ -604,7 +665,6 @@ def generate(args):
         wan_i2v = wan.WanI2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
-            quant_data_dir=args.quant_data_dir,
             device_id=device,
             rank=rank,
             t5_fsdp=args.t5_fsdp,
@@ -613,9 +673,9 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
             use_vae_parallel=args.vae_parallel,
-            quant_mode=args.quant_mode
+            quant_dit_path=args.quant_dit_path
         )
-        
+
         transformer_low = wan_i2v.low_noise_model
         transformer_high = wan_i2v.high_noise_model
 
@@ -626,23 +686,19 @@ def generate(args):
             else:
                 transformer_low.rainfusion_config = rainfusion_config
                 transformer_high.rainfusion_config = rainfusion_config
-        
+
         if args.tp_size > 1:
             logging.info("Initializing Tensor Parallel ...")
             applicator = TensorParallelApplicator(args.tp_size, device_map="cpu")
             applicator.apply_to_model(transformer_low)
             applicator.apply_to_model(transformer_high)
-        # wan_i2v.low_noise_model.to("npu")
-        # wan_i2v.high_noise_model.to("npu")
-
-        if args.quant_mode == 2:
-            logging.info(f"quantize weights saved, will be return")
-            return
+        wan_i2v.low_noise_model.to("npu")
+        wan_i2v.high_noise_model.to("npu")
 
         if args.use_attentioncache:
             config_low = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_low.blocks),
+                blocks_count=len(transformer_low.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps,
                 step_start=args.start_step,
                 step_interval=args.attentioncache_interval,
@@ -651,12 +707,12 @@ def generate(args):
         else:
             config_low = CacheConfig(
                 method="attention_cache",
-                blocks_count=len(transformer_low.blocks),
+                blocks_count=len(transformer_low.blocks) * 2 // args.cfg_size,
                 steps_count=args.sample_steps
             )
         config_high = CacheConfig(
             method="attention_cache",
-            blocks_count=len(transformer_high.blocks),
+            blocks_count=len(transformer_high.blocks) * 2 // args.cfg_size,
             steps_count=args.sample_steps
         )
         cache_low = CacheAgent(config_low)
@@ -668,7 +724,7 @@ def generate(args):
                 block._fsdp_wrapped_module.args = args
             for block in transformer_low._fsdp_wrapped_module.blocks:
                 block._fsdp_wrapped_module.cache = cache_low
-                block._fsdp_wrapped_module.args = args  
+                block._fsdp_wrapped_module.args = args
         else:
             for block in transformer_high.blocks:
                 block.cache = cache_high

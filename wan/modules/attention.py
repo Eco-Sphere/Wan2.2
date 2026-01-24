@@ -21,7 +21,7 @@ __all__ = [
     'attention',
 ]
 
-from mindiesd import attention_forward
+from wan.utils.rainfusion import Rainfusion
 
 
 def flash_attention(
@@ -131,65 +131,3 @@ def flash_attention(
 
     # output
     return x.type(out_dtype)
-
-
-def attention(
-    q,
-    k,
-    v,
-    q_lens=None,
-    k_lens=None,
-    dropout_p=0.,
-    softmax_scale=None,
-    q_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    deterministic=False,
-    dtype=torch.bfloat16,
-    version=None,
-    rainfusion_config=None,
-):
-    if torch.npu.is_available():
-        qtype = q.dtype
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
-        if version is None and q.shape[1] == k.shape[1] and int(os.getenv('ALGO', 0)) == 1:
-            out = attention_forward(q, k, v,
-                                opt_mode="manual", op_type="ascend_laser_attention", layout="BNSD")
-        else:
-            out = attention_forward(q, k, v,
-                                opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
-        return out.to(qtype)
-    elif FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
-        return flash_attention(
-            q=q,
-            k=k,
-            v=v,
-            q_lens=q_lens,
-            k_lens=k_lens,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            q_scale=q_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic,
-            dtype=dtype,
-            version=version,
-        )
-    else:
-        if q_lens is not None or k_lens is not None:
-            warnings.warn(
-                'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
-            )
-        attn_mask = None
-
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
-
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
-
-        out = out.transpose(1, 2).contiguous()
-        return out

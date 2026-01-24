@@ -1,6 +1,8 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
 import logging
+import os
+import warnings
 
 import torch
 import torch_npu
@@ -8,9 +10,10 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention, attention
+from .attention import flash_attention
 
-from mindiesd import rotary_position_embedding
+from mindiesd import rotary_position_embedding, attention_forward
+
 from wan.utils.rainfusion import Rainfusion
 __all__ = ['WanModel']
 
@@ -28,7 +31,7 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('npu', enabled=False)
 def rope_params(max_seq_len, dim, theta=10000):
     assert dim % 2 == 0
     freqs = torch.outer(
@@ -39,16 +42,10 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('npu', enabled=False)
 def rope_apply(x, grid_sizes, freqs_list):
-    s, n, c = x.size(1), x.size(2), x.size(3)
-    output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        x_i = x[i, :s].reshape(1, s, n, c)
-        cos, sin = freqs_list[i]
-        x_i = rotary_position_embedding(x_i, cos, sin, rotated_mode="rotated_interleaved", fused=True)
-        output.append(x_i)
-    return torch.cat(output).float()
+    cos, sin = freqs_list[0]
+    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
 
 
 class WanRMSNorm(nn.Module):
@@ -81,25 +78,25 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return torch_npu.npu_layer_norm_eval(
-            x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps
+        return torch.nn.functional.layer_norm(
+            x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps,
         )
 
 
-class WanLayerNormModulate(nn.LayerNorm):
+# class WanLayerNormModulate(nn.LayerNorm):
 
-    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
-        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
-        self.dim = dim
+#     def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+#         super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+#         self.dim = dim
 
-    def forward(self, x, weight, scale):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-        """
-        return torch_npu.npu_layer_norm_eval(
-            x, normalized_shape=[self.dim], weight=weight, bias=scale, eps=self.eps,
-        )
+#     def forward(self, x, weight, scale):
+#         r"""
+#         Args:
+#             x(Tensor): Shape [B, L, C]
+#         """
+#         return torch_npu.npu_layer_norm_eval(
+#             x, normalized_shape=[self.dim], weight=weight, bias=scale, eps=self.eps,
+#         )
 
 
 class WanSelfAttention(nn.Module):
@@ -127,6 +124,73 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+    def attention(self,
+        q,
+        k,
+        v,
+        q_lens=None,
+        k_lens=None,
+        dropout_p=0.,
+        softmax_scale=None,
+        q_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+        deterministic=False,
+        dtype=torch.bfloat16,
+        version=None,
+        rainfusion_config=None,
+        t_idx=None
+    ):
+        if torch.npu.is_available():
+            qtype = q.dtype
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+            if rainfusion_config is not None and q.shape[1] == k.shape[1]:
+                rainfusion_fa = Rainfusion(
+                    grid_size=rainfusion_config["grid_size"],
+                    skip_timesteps=rainfusion_config["skip_timesteps"],
+                    sparsity=rainfusion_config["sparsity"],
+                )
+                out = rainfusion_fa(
+                    q, k, v,
+                    atten_mask_all=rainfusion_config["atten_mask_all"],
+                    text_len=0,
+                    t_idx=t_idx,
+                )
+            elif version is None and q.shape[1] == k.shape[1] and int(os.getenv('ALGO', 0)) == 1:
+                out = attention_forward(q, k, v,
+                                    opt_mode="manual", op_type="ascend_laser_attention", layout="BNSD")
+            elif version is None and q.shape[1] == k.shape[1] and int(os.getenv('ALGO', 0)) == 3:
+                if hasattr(self, 'fa_quant'):
+                    out = self.fa_quant(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), layout="BNSD")
+                else:
+                    scale = q.shape[-1] ** -0.5
+                    out = torch_npu.npu_fused_infer_attention_score(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2),
+                            num_heads = q.shape[2], input_layout = "BNSD", scale = scale, pre_tokens=2147483647, next_tokens=2147483647)[0]
+                out = out.transpose(1,2)
+            else:
+                out = attention_forward(q, k, v,
+                                    opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
+            return out.to(qtype)
+        else:
+            if q_lens is not None or k_lens is not None:
+                warnings.warn(
+                    'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
+                )
+            attn_mask = None
+
+            q = q.transpose(1, 2).to(dtype)
+            k = k.transpose(1, 2).to(dtype)
+            v = v.transpose(1, 2).to(dtype)
+
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+
+            out = out.transpose(1, 2).contiguous()
+            return out
+
+
     def forward(self, x, seq_lens, grid_sizes, freqs, args=None, rainfusion_config=None, t_idx=None):
         r"""
         Args:
@@ -146,13 +210,15 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = attention(
+        x = self.attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size,
-            rainfusion_config=rainfusion_config)
+            rainfusion_config=rainfusion_config,
+            t_idx=t_idx,
+        )
 
         # output
         x = x.flatten(2)
@@ -177,7 +243,7 @@ class WanCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = attention(q, k, v, k_lens=context_lens)
+        x = self.attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)

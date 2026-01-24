@@ -28,17 +28,10 @@ def pad_freqs(original_tensor, target_len):
     return padded_tensor
 
 
-@torch.amp.autocast('cuda', enabled=False)
+@torch.amp.autocast('npu', enabled=False)
 def rope_apply(x, grid_sizes, freqs_list):
-    s, n, c = x.size(1), x.size(2), x.size(3)
-    output = []
-
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        x_i = x[i, :s].reshape(1, s, n, c)
-        cos, sin = freqs_list[i]
-        x_i = rotary_position_embedding(x_i, cos, sin, rotated_mode="rotated_interleaved", fused=True)
-        output.append(x_i)
-    return torch.cat(output).float()
+    cos, sin = freqs_list[0]
+    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
 
 
 def sp_dit_forward(
@@ -181,7 +174,7 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, args, dtype=torch.bflo
     q = rope_apply(q, grid_sizes, freqs)
     k = rope_apply(k, grid_sizes, freqs)
 
-    x = xFuserLongContextAttention(args, rainfusion_config=rainfusion_config)(
+    x = xFuserLongContextAttention(args, rainfusion_config=rainfusion_config, fa_quant=getattr(self, 'fa_quant', None))(
         None,
         query=half(q),
         key=half(k),
