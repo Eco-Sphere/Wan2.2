@@ -12,7 +12,7 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
 
-from mindiesd import rotary_position_embedding, attention_forward
+from mindiesd import rotary_position_embedding, attention_forward, layernorm_scale_shift
 
 from wan.utils.rainfusion import Rainfusion
 __all__ = ['WanModel']
@@ -81,6 +81,21 @@ class WanLayerNorm(nn.LayerNorm):
         return torch.nn.functional.layer_norm(
             x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps,
         )
+
+
+def WanAdaLayerNorm(
+    layernorm: torch.nn.LayerNorm, 
+    x: torch.Tensor, 
+    scale: torch.Tensor, 
+    shift: torch.Tensor
+):
+    return layernorm_scale_shift(
+        layernorm,
+        x,
+        scale[:, 0, :],
+        shift[:, 0, :],
+        fused=True
+    )
 
 
 # class WanLayerNormModulate(nn.LayerNorm):
@@ -320,7 +335,7 @@ class WanAttentionBlock(nn.Module):
 
         y = self.cache.apply(
                 self.self_attn,
-                self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2),
+                WanAdaLayerNorm(self.norm1, x, e[1].squeeze(2), e[0].squeeze(2)),
                 seq_lens,
                 grid_sizes,
                 freqs,
@@ -335,7 +350,7 @@ class WanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(
-                self.norm2(x) * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
+                WanAdaLayerNorm(self.norm2, x, e[4].squeeze(2), e[3].squeeze(2)))
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 x = x + y * e[5].squeeze(2)
             return x
