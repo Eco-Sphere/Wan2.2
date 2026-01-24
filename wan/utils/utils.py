@@ -12,6 +12,10 @@ import torchvision
 __all__ = ['save_video', 'save_image', 'str2bool']
 
 
+def use_cfg(cfg_scale:float=1.0, eps:float=1e-6):
+    return abs(cfg_scale - 1.0) > eps
+
+
 def rand_name(length=8, suffix=''):
     name = binascii.b2a_hex(os.urandom(length)).decode('utf-8')
     if suffix:

@@ -33,7 +33,7 @@ from wan.distributed.parallel_mgr import (
     get_classifier_free_guidance_rank,
     get_cfg_group,
 )
-from .utils.utils import find_quant_config_file
+from .utils.utils import find_quant_config_file, use_cfg
 
 
 class WanT2V:
@@ -401,18 +401,29 @@ class WanT2V:
 
                 if get_classifier_free_guidance_world_size() == 2:
                     noise_pred = model(
-                        latent_model_input, t=timestep, **arg_all, t_idx=t_idx)[0]
+                        latent_model_input, t=timestep, **arg_all, t_idx=t_idx)[0].to(
+                            torch.device('cpu') if offload_model else self.device)
                     noise_pred_cond, noise_pred_uncond = get_cfg_group().all_gather(
                         noise_pred, separate_tensors=True
                     )
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
                 else:
                     noise_pred_cond = model(
                         latent_model_input, t=timestep, **arg_c, t_idx=t_idx)[0]
-                    noise_pred_uncond = model(
-                        latent_model_input, t=timestep, **arg_null, t_idx=t_idx)[0]
-
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    if use_cfg(sample_guide_scale):
+                        noise_pred_uncond = model(
+                            latent_model_input, t=timestep, **arg_null, t_idx=t_idx)[0]
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        noise_pred = noise_pred_uncond + sample_guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
+                    else:
+                        noise_pred = noise_pred_cond
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),

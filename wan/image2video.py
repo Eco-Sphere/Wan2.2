@@ -35,7 +35,7 @@ from wan.distributed.parallel_mgr import (
     get_classifier_free_guidance_rank,
     get_cfg_group
 )
-from .utils.utils import find_quant_config_file
+from .utils.utils import find_quant_config_file, use_cfg
 
 
 class WanI2V:
@@ -460,19 +460,23 @@ class WanI2V:
                     )
                     if offload_model:
                         torch.cuda.empty_cache()
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
                 else:
                     noise_pred_cond = model(
                         latent_model_input, t=timestep, **arg_c, t_idx=t_idx)[0]
                     if offload_model:
                         torch.cuda.empty_cache()
-                    noise_pred_uncond = model(
-                        latent_model_input, t=timestep, **arg_null, t_idx=t_idx)[0]
-                    if offload_model:
-                        torch.cuda.empty_cache()
-
-                noise_pred = noise_pred_uncond + sample_guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
-
+                    if use_cfg(sample_guide_scale):
+                        noise_pred_uncond = model(
+                            latent_model_input, t=timestep, **arg_null, t_idx=t_idx)[0]
+                        if offload_model:
+                            torch.cuda.empty_cache()
+                        noise_pred = noise_pred_uncond + sample_guide_scale * (
+                            noise_pred_cond - noise_pred_uncond)
+                    else:
+                        noise_pred = noise_pred_cond
+                
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
                     t,
