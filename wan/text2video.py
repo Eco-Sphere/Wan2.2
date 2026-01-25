@@ -8,6 +8,7 @@ import sys
 import types
 from contextlib import contextmanager
 from functools import partial
+import time
 
 import torch
 import torch.cuda.amp as amp
@@ -298,6 +299,8 @@ class WanT2V:
                 - H: Frame height (from size)
                 - W: Frame width from size)
         """
+        torch.cuda.synchronize()
+        preprocess_time = time.time()
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
@@ -388,7 +391,14 @@ class WanT2V:
                 'seq_len': seq_len
             }
 
+            torch.cuda.synchronize()
+            preprocess_time = time.time() - preprocess_time
+            dit_time_list = []
+            dit_time_list_str = []
+
             for t_idx, t in enumerate(tqdm(timesteps)):
+                torch.cuda.synchronize()
+                dit_time = time.time()
                 latent_model_input = latents
                 timestep = [t]
 
@@ -433,14 +443,23 @@ class WanT2V:
                     generator=seed_g)[0]
                 latents = [temp_x0.squeeze(0)]
 
+                torch.cuda.synchronize()
+                dit_time = time.time() - dit_time
+                dit_time_list_str.append(f"{dit_time:.2f}")
+                dit_time_list.append(dit_time)
+
             x0 = latents
             if offload_model:
                 self.low_noise_model.cpu()
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
+            
+            vae_decode_time = time.time()
             if self.rank < 8:
                 with VAE_patch_parallel():
                     videos = self.vae.decode(x0)
+            torch.cuda.synchronize()
+            vae_decode_time = time.time() - vae_decode_time
 
         del noise, latents
         del sample_scheduler
@@ -458,4 +477,10 @@ class WanT2V:
         if dist.is_initialized():
             dist.barrier()
 
+        logging.info(f"===============================")
+        logging.info(f"Preprocess time: {preprocess_time:.2f}")
+        logging.info(f"Dit time list: {dit_time_list_str}")
+        logging.info(f"Dit E2E Time: {sum(dit_time_list):.2f}")
+        logging.info(f"VAE decode time: {vae_decode_time:.2f}s")
+        logging.info(f"===============================")
         return videos[0] if self.rank == 0 else None
