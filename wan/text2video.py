@@ -35,6 +35,7 @@ from wan.distributed.parallel_mgr import (
     get_cfg_group,
 )
 from .utils.utils import find_quant_config_file, use_cfg, profiling_sample
+from .utils.patch_linear_with_fp8 import patch_linear_with_fp8
 
 
 class WanT2V:
@@ -216,6 +217,10 @@ class WanT2V:
                 model.to(self.param_dtype)
             # if not self.init_on_cpu:
             #     model.to(self.device)
+        
+        if int(os.getenv("ENABLE_ONLINE_FP8_QUANT", 0)):
+            patcher = patch_linear_with_fp8()
+            patcher.register_model(model)
 
         return model
 
