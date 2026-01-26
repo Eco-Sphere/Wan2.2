@@ -34,7 +34,7 @@ from wan.distributed.parallel_mgr import (
     get_classifier_free_guidance_rank,
     get_cfg_group,
 )
-from .utils.utils import find_quant_config_file, use_cfg
+from .utils.utils import find_quant_config_file, use_cfg, profiling_sample
 
 
 class WanT2V:
@@ -396,6 +396,11 @@ class WanT2V:
             dit_time_list = []
             dit_time_list_str = []
 
+            if sampling_steps >= 4 and self.rank == 0:
+                prof = profiling_sample()
+            else:
+                prof = None
+
             for t_idx, t in enumerate(tqdm(timesteps)):
                 torch.cuda.synchronize()
                 dit_time = time.time()
@@ -447,6 +452,12 @@ class WanT2V:
                 dit_time = time.time() - dit_time
                 dit_time_list_str.append(f"{dit_time:.2f}")
                 dit_time_list.append(dit_time)
+
+                if prof is not None:
+                    prof.step()
+
+            if prof is not None:
+                prof.__exit__(None, None, None)
 
             x0 = latents
             if offload_model:

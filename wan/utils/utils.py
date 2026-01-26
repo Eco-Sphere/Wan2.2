@@ -172,3 +172,42 @@ def find_quant_config_file(quant_config_path):
         use_nz = False
 
     return quant_config_desc_path, use_nz
+
+
+def profiling_sample():
+    import torch_npu
+    if os.getenv("PROFILING_ENABLE", "0") == "1":
+        profiling_dir = os.getenv("PROFILING_DIR", "./prof")
+        if int(os.getenv("PROFILING_LEVEL", "0")) == 1:
+            profiling_level = torch_npu.profiler.ProfilerLevel.Level1
+        elif int(os.getenv("PROFILING_LEVEL", "0")) == 2:
+            profiling_level = torch_npu.profiler.ProfilerLevel.Level2
+        else:
+            profiling_level = torch_npu.profiler.ProfilerLevel.Level0
+        profiling_python_stack = True if int(os.getenv("PROFILING_PYTHON_STACK", "0")) == 1 else False
+        
+        logging.info(f"Profiling level: {profiling_level}")
+        logging.info(f"Profiling python stack: {profiling_python_stack}")
+        logging.info(f"Profiling dir: {profiling_dir}")
+
+        experimental_config = torch_npu.profiler._ExperimentalConfig(
+            export_type=torch_npu.profiler.ExportType.Text,
+            aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+            profiler_level=profiling_level,
+            l2_cache=False,
+            data_simplification=False
+        )
+        prof = torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+            with_stack=profiling_python_stack,
+            record_shapes=True,
+            profile_memory=False,
+            schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=0),
+            experimental_config=experimental_config,
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profiling_dir)
+        )
+        prof.__enter__()
+
+        return prof
+    else:
+        return None
