@@ -12,7 +12,7 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
 
-from mindiesd import rotary_position_embedding, attention_forward, layernorm_scale_shift
+from mindiesd import rotary_position_embedding, attention_forward, layernorm_scale_shift, fast_layernorm
 
 from wan.utils.rainfusion import Rainfusion
 __all__ = ['WanModel']
@@ -45,7 +45,8 @@ def rope_params(max_seq_len, dim, theta=10000):
 @torch.amp.autocast('npu', enabled=False)
 def rope_apply(x, grid_sizes, freqs_list):
     cos, sin = freqs_list[0]
-    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
+    return rotary_position_embedding(x, cos.to(x.dtype), sin.to(x.dtype), rotated_mode="rotated_interleaved", fused=True)
+    # return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
 
 
 class WanRMSNorm(nn.Module):
@@ -81,6 +82,20 @@ class WanLayerNorm(nn.LayerNorm):
         return torch.nn.functional.layer_norm(
             x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps,
         )
+
+
+class WanFastLayerNorm(WanLayerNorm):
+    
+    def forward(self, x):
+        # return super().forward(x)
+        return fast_layernorm(self, x)
+
+
+class WanFastGelu(nn.GELU):
+
+    def forward(self, x):
+        # return super().forward(x)
+        return torch_npu.npu_fast_gelu(x)
 
 
 def WanAdaLayerNorm(
@@ -139,7 +154,39 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
+        # use_all_head
+        self.use_all_head = int(os.getenv('USE_ALL_HEAD', 0))
+
+
     def attention(self,
+        q,
+        k,
+        v,
+        **kwargs
+    ):
+        if self.use_all_head:
+            out = self._attention_op(q, k, v, **kwargs)
+        else:
+            query_layer_list = q.split(1, dim=2)
+            key_layer_list = k.split(1, dim=2)
+            value_layer_list = v.split(1, dim=2)
+            output = []
+            for_loop = q.shape[2]
+
+            for i in range(for_loop):
+                output.append(
+                    self._attention_op(
+                        query_layer_list[i],
+                        key_layer_list[i],
+                        value_layer_list[i],
+                        **kwargs
+                    )
+                )
+            out = torch.cat(output, dim=2)
+        return out
+
+
+    def _attention_op(self,
         q,
         k,
         v,
@@ -286,19 +333,19 @@ class WanAttentionBlock(nn.Module):
         self.eps = eps
 
         # layers
-        self.norm1 = WanLayerNorm(dim, eps)
+        self.norm1 = WanFastLayerNorm(dim, eps)
         # self.norm1 = WanLayerNormModulate(dim, eps)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm,
                                           eps)
-        self.norm3 = WanLayerNorm(
+        self.norm3 = WanFastLayerNorm(
             dim, eps,
             elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WanCrossAttention(dim, num_heads, (-1, -1), qk_norm,
                                             eps)
-        self.norm2 = WanLayerNorm(dim, eps)
+        self.norm2 = WanFastLayerNorm(dim, eps)
         # self.norm2 = WanLayerNormModulate(dim, eps)
         self.ffn = nn.Sequential(
-            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
+            nn.Linear(dim, ffn_dim), WanFastGelu(approximate='tanh'),
             nn.Linear(ffn_dim, dim))
 
         # modulation
@@ -478,7 +525,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
         self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
+            nn.Linear(text_dim, dim), WanFastGelu(approximate='tanh'),
             nn.Linear(dim, dim))
 
         self.time_embedding = nn.Sequential(
