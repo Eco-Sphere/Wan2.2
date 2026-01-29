@@ -126,54 +126,83 @@ class WanI2V:
                 set_vae_patch_parallel(self.vae.model, 4, 2, all_pp_group_ranks= all_pp_group_ranks, decoder_decode="decoder.forward")
                 set_vae_patch_parallel(self.vae.model, 4, 2, all_pp_group_ranks= all_pp_group_ranks, decoder_decode="encoder.forward")
         
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.low_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.low_noise_checkpoint, torch_dtype=self.param_dtype)
-        if quant_dit_path:
-            quant_dit_path = os.path.abspath(quant_dit_path)
-            quant_low_noise_path = os.path.join(quant_dit_path, config.low_noise_checkpoint)
-            quant_low_noise_desc_path, use_nz = find_quant_config_file(quant_low_noise_path)
-            if not os.path.exists(quant_low_noise_desc_path):
-                raise FileNotFoundError(f"Quantization description file not found: {quant_low_noise_desc_path}")
-            logging.info(f"Enabled quant, trying to load quantized low noise DiT model from {quant_low_noise_path}...")
-            from mindiesd import quantize
-            quantize(
+        WAN_MODEL_SCHEMA = os.environ.get("WAN_MODEL_SCHEMA", "Wan2.2")
+
+        if WAN_MODEL_SCHEMA == "Wan2.2":
+            logging.info(f"Creating WanModel from {checkpoint_dir}")
+            self.low_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.low_noise_checkpoint, torch_dtype=self.param_dtype)
+            if quant_dit_path:
+                quant_dit_path = os.path.abspath(quant_dit_path)
+                quant_low_noise_path = os.path.join(quant_dit_path, config.low_noise_checkpoint)
+                quant_low_noise_desc_path, use_nz = find_quant_config_file(quant_low_noise_path)
+                if not os.path.exists(quant_low_noise_desc_path):
+                    raise FileNotFoundError(f"Quantization description file not found: {quant_low_noise_desc_path}")
+                logging.info(f"Enabled quant, trying to load quantized low noise DiT model from {quant_low_noise_path}...")
+                from mindiesd import quantize
+                quantize(
+                    model=self.low_noise_model,
+                    quant_des_path=quant_low_noise_desc_path,
+                    use_nz=use_nz
+                )
+                logging.info("Load quantized low noise DiT model successfully")
+
+            self.low_noise_model = self._configure_model(
                 model=self.low_noise_model,
-                quant_des_path=quant_low_noise_desc_path,
-                use_nz=use_nz
-            )
-            logging.info("Load quantized low noise DiT model successfully")
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
 
-        self.low_noise_model = self._configure_model(
-            model=self.low_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            self.high_noise_model = WanModel.from_pretrained(
+                checkpoint_dir, subfolder=config.high_noise_checkpoint, torch_dtype=self.param_dtype)
+            if quant_dit_path:
+                quant_dit_path = os.path.abspath(quant_dit_path)
+                quant_high_noise_path = os.path.join(quant_dit_path, config.high_noise_checkpoint)
+                quant_high_noise_desc_path, use_nz = find_quant_config_file(quant_high_noise_path)
+                if not os.path.exists(quant_high_noise_desc_path):
+                    raise FileNotFoundError(f"Quantization description file not found: {quant_high_noise_desc_path}")
+                logging.info(f"Enabled quant, trying to load quantized high noise DiT model from {quant_high_noise_path}...")
+                from mindiesd import quantize
+                quantize(
+                    model=self.high_noise_model,
+                    quant_des_path=quant_high_noise_desc_path,
+                    use_nz=use_nz
+                )
+                logging.info("Load quantized high noise DiT model successfully")
 
-        self.high_noise_model = WanModel.from_pretrained(
-            checkpoint_dir, subfolder=config.high_noise_checkpoint, torch_dtype=self.param_dtype)
-        if quant_dit_path:
-            quant_dit_path = os.path.abspath(quant_dit_path)
-            quant_high_noise_path = os.path.join(quant_dit_path, config.high_noise_checkpoint)
-            quant_high_noise_desc_path, use_nz = find_quant_config_file(quant_high_noise_path)
-            if not os.path.exists(quant_high_noise_desc_path):
-                raise FileNotFoundError(f"Quantization description file not found: {quant_high_noise_desc_path}")
-            logging.info(f"Enabled quant, trying to load quantized high noise DiT model from {quant_high_noise_path}...")
-            from mindiesd import quantize
-            quantize(
+            self.high_noise_model = self._configure_model(
                 model=self.high_noise_model,
-                quant_des_path=quant_high_noise_desc_path,
-                use_nz=use_nz
-            )
-            logging.info("Load quantized high noise DiT model successfully")
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
+        
+        elif WAN_MODEL_SCHEMA == "Wan2.1":
+            logging.info(f"Creating WanModel from {checkpoint_dir}")
+            self.low_noise_model = WanModel.from_pretrained(checkpoint_dir).to(torch.bfloat16)
+            if quant_dit_path:
+                quant_dit_path = os.path.abspath(quant_dit_path)
+                quant_low_noise_path = os.path.join(quant_dit_path, config.low_noise_checkpoint)
+                quant_low_noise_desc_path, use_nz = find_quant_config_file(quant_low_noise_path)
+                if not os.path.exists(quant_low_noise_desc_path):
+                    raise FileNotFoundError(f"Quantization description file not found: {quant_low_noise_desc_path}")
+                logging.info(f"Enabled quant, trying to load quantized low noise DiT model from {quant_low_noise_path}...")
+                from mindiesd import quantize
+                quantize(
+                    model=self.low_noise_model,
+                    quant_des_path=quant_low_noise_desc_path,
+                    use_nz=use_nz
+                )
+                logging.info("Load quantized low noise DiT model successfully")
+            self.low_noise_model = self._configure_model(
+                model=self.low_noise_model,
+                use_sp=use_sp,
+                dit_fsdp=dit_fsdp,
+                shard_fn=shard_fn,
+                convert_model_dtype=convert_model_dtype)
 
-        self.high_noise_model = self._configure_model(
-            model=self.high_noise_model,
-            use_sp=use_sp,
-            dit_fsdp=dit_fsdp,
-            shard_fn=shard_fn,
-            convert_model_dtype=convert_model_dtype)
+            self.high_noise_model = self.low_noise_model
         
         if use_sp:
             self.sp_size = get_sequence_parallel_world_size()
