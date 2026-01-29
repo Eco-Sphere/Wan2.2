@@ -28,6 +28,8 @@ from .utils.fm_solvers import (
     retrieve_timesteps,
 )
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from .utils.fm_solvers_euler import EulerScheduler
+
 from .vae_patch_parallel import VAE_patch_parallel, set_vae_patch_parallel
 from wan.distributed.parallel_mgr import (
     get_sequence_parallel_world_size,
@@ -413,6 +415,14 @@ class WanI2V:
                     sample_scheduler,
                     device=self.device,
                     sigmas=sampling_sigmas)
+            elif sample_solver == "euler":
+                sample_scheduler = EulerScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=shift,
+                    device=self.device)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device)
+                timesteps = sample_scheduler.timesteps[:-1].clone()
             else:
                 raise NotImplementedError("Unsupported solver.")
 
