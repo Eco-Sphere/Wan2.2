@@ -37,8 +37,9 @@ from wan.distributed.parallel_mgr import (
     get_classifier_free_guidance_rank,
     get_cfg_group
 )
-from .utils.utils import find_quant_config_file, use_cfg
+from .utils.utils import find_quant_config_file, use_cfg, profiling_sample
 
+import time
 
 class WanI2V:
 
@@ -309,6 +310,9 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        torch.npu.synchronize()
+        preprocess_time = time.time()
+
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
             guide_scale, float) else guide_scale
@@ -447,10 +451,22 @@ class WanI2V:
                 'y': [y],
             }
 
+            torch.npu.synchronize()
+            preprocess_time = time.time() - preprocess_time
+            dit_time_list = []
+            dit_time_list_str = []
+
+            if sampling_steps >= 4 and self.rank == 0:
+                prof = profiling_sample()
+            else:
+                prof = None
+
             if offload_model:
                 torch.cuda.empty_cache()
 
             for t_idx, t in enumerate(tqdm(timesteps)):
+                torch.npu.synchronize()
+                dit_time = time.time()
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -495,6 +511,14 @@ class WanI2V:
                     generator=seed_g)[0]
                 latent = temp_x0.squeeze(0)
 
+                torch.npu.synchronize()
+                dit_time = time.time() - dit_time
+                dit_time_list_str.append(f"{dit_time:.2f}")
+                dit_time_list.append(dit_time)
+
+                if prof is not None:
+                    prof.step()
+
                 x0 = [latent]
                 del latent_model_input, timestep
 
@@ -503,9 +527,12 @@ class WanI2V:
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
 
+            vae_decode_time = time.time()
             if self.rank < 8:
                 with VAE_patch_parallel():
                     videos = self.vae.decode(x0)
+            torch.cuda.synchronize()
+            vae_decode_time = time.time() - vae_decode_time
 
         del noise, latent, x0
         del sample_scheduler
@@ -523,4 +550,10 @@ class WanI2V:
         if dist.is_initialized():
             dist.barrier()
 
+        logging.info(f"===============================")
+        logging.info(f"Preprocess time: {preprocess_time:.2f}")
+        logging.info(f"Dit time list: {dit_time_list_str}")
+        logging.info(f"Dit E2E Time: {sum(dit_time_list):.2f}")
+        logging.info(f"VAE decode time: {vae_decode_time:.2f}s")
+        logging.info(f"===============================")
         return videos[0] if self.rank == 0 else None
