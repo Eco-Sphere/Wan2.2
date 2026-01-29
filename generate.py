@@ -49,6 +49,30 @@ EXAMPLE_PROMPT = {
 }
 
 
+def process_image(img, target_big, target_small):
+    original_width, original_height = img.size
+    if original_width > original_height:
+        target_width, target_height = target_big, target_small
+    else:
+        target_width, target_height = target_small, target_big
+
+    width_ratio = target_width / original_width
+    height_ratio = target_height / original_height
+    scale_ratio = min(width_ratio, height_ratio)
+
+    new_width = int(original_width * scale_ratio)
+    new_height = int(original_height * scale_ratio)
+
+    img_resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+
+    paste_x = (target_width - new_width) // 2
+    paste_y = (target_height - new_height) // 2
+    canvas.paste(img_resized, (paste_x, paste_y))
+
+    return canvas
+
+
 def _validate_args(args):
     # Basic check
     assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
@@ -430,6 +454,11 @@ def generate(args):
     if args.image is not None:
         img = Image.open(args.image).convert("RGB")
         logging.info(f"Input image: {args.image}")
+
+        arg_width, arg_height = args.size.split("*")
+        arg_height = int(arg_height)
+        arg_width = int(arg_width)
+        img = process_image(img, arg_width, arg_height)
 
     # prompt extend
     if args.use_prompt_extend:

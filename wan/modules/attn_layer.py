@@ -63,7 +63,7 @@ class xFuserLongContextAttention(LongContextAttention):
             )
         self.world_size = dist.get_world_size()
         self.args = args
-        self.video_size = ['480*832', '832*480', '480*720', '720*480']
+        self.video_size = ['480*832', '832*480', '480*720', '720*480', '768*432', '432*768']
 
         self.algo = int(os.getenv('ALGO', 0))
 
