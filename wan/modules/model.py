@@ -12,7 +12,17 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
 
-from mindiesd import rotary_position_embedding, attention_forward, layernorm_scale_shift, fast_layernorm
+from mindiesd import rotary_position_embedding, attention_forward
+
+try:
+    from mindiesd import layernorm_scale_shift
+except:
+    layernorm_scale_shift = None
+
+try:
+    from mindiesd import fast_layernorm
+except:
+    fast_layernorm = None
 
 from wan.utils.rainfusion import Rainfusion
 __all__ = ['WanModel']
@@ -87,9 +97,10 @@ class WanLayerNorm(nn.LayerNorm):
 class WanFastLayerNorm(WanLayerNorm):
     
     def forward(self, x):
-        # return super().forward(x)
-        return fast_layernorm(self, x)
-
+        if fast_layernorm:
+            return fast_layernorm(self, x)
+        else:
+            return super().forward(x)
 
 class WanFastGelu(nn.GELU):
 
@@ -104,13 +115,16 @@ def WanAdaLayerNorm(
     scale: torch.Tensor, 
     shift: torch.Tensor
 ):
-    return layernorm_scale_shift(
-        layernorm,
-        x,
-        scale[:, 0, :],
-        shift[:, 0, :],
-        fused=True
-    )
+    if layernorm_scale_shift:
+        return layernorm_scale_shift(
+            layernorm,
+            x,
+            scale[:, 0, :],
+            shift[:, 0, :],
+            fused=True
+        )
+    else:
+        return layernorm(x) * (1 + scale) + shift
 
 
 # class WanLayerNormModulate(nn.LayerNorm):
