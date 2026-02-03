@@ -177,7 +177,12 @@ class WanSelfAttention(nn.Module):
         v,
         **kwargs
     ):
-        if self.use_all_head:
+        if 'use_all_head' in kwargs:
+            use_all_head = kwargs.pop('use_all_head')
+        else:
+            use_all_head = self.use_all_head
+
+        if use_all_head:
             out = self._attention_op(q, k, v, **kwargs)
         else:
             query_layer_list = q.split(1, dim=2)
@@ -293,6 +298,7 @@ class WanSelfAttention(nn.Module):
             window_size=self.window_size,
             rainfusion_config=rainfusion_config,
             t_idx=t_idx,
+            use_all_head=self.use_all_head
         )
 
         # output
@@ -318,7 +324,7 @@ class WanCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = self.attention(q, k, v, k_lens=context_lens)
+        x = self.attention(q, k, v, k_lens=context_lens, use_all_head=False)
 
         # output
         x = x.flatten(2)
