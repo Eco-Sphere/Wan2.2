@@ -55,8 +55,7 @@ def rope_params(max_seq_len, dim, theta=10000):
 @torch.amp.autocast('npu', enabled=False)
 def rope_apply(x, grid_sizes, freqs_list):
     cos, sin = freqs_list[0]
-    return rotary_position_embedding(x, cos.to(x.dtype), sin.to(x.dtype), rotated_mode="rotated_interleaved", fused=True)
-    # return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
+    return rotary_position_embedding(x, cos, sin, rotated_mode="rotated_interleaved", fused=True)
 
 
 class WanRMSNorm(nn.Module):
@@ -667,8 +666,8 @@ class WanModel(ModelMixin, ConfigMixin):
                                     dim=-1).reshape(seq_len, 1, -1)
 
                 cos, sin = torch.chunk(torch.view_as_real(freqs_i.to(torch.complex64)), 2, dim=-1)
-                cos = cos.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2)
-                sin = sin.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2)
+                cos = cos.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2).to(x.dtype)
+                sin = sin.unsqueeze(0).expand(-1, -1, -1, -1, 2).flatten(-2).to(x.dtype)
                 freqs_i = (cos, sin)
                 freqs_list.append(freqs_i)
             self.freqs_list = freqs_list
