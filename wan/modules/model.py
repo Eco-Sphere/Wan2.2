@@ -104,8 +104,8 @@ class WanFastLayerNorm(WanLayerNorm):
 class WanFastGelu(nn.GELU):
 
     def forward(self, x):
-        # return super().forward(x)
-        return torch_npu.npu_fast_gelu(x)
+        return super().forward(x)
+        # return torch_npu.npu_fast_gelu(x)
 
 
 def WanAdaLayerNorm(
