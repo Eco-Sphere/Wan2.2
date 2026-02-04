@@ -38,6 +38,7 @@ from wan.distributed.parallel_mgr import (
     get_cfg_group
 )
 from .utils.utils import find_quant_config_file, use_cfg, profiling_sample
+from .utils.patch_linear_with_fp8 import patch_linear_with_fp8
 
 import time
 
@@ -183,15 +184,14 @@ class WanI2V:
             self.low_noise_model = WanModel.from_pretrained(checkpoint_dir).to(torch.bfloat16)
             if quant_dit_path:
                 quant_dit_path = os.path.abspath(quant_dit_path)
-                quant_low_noise_path = os.path.join(quant_dit_path, config.low_noise_checkpoint)
-                quant_low_noise_desc_path, use_nz = find_quant_config_file(quant_low_noise_path)
-                if not os.path.exists(quant_low_noise_desc_path):
-                    raise FileNotFoundError(f"Quantization description file not found: {quant_low_noise_desc_path}")
-                logging.info(f"Enabled quant, trying to load quantized low noise DiT model from {quant_low_noise_path}...")
+                quant_noise_desc_path, use_nz = find_quant_config_file(quant_dit_path)
+                if not os.path.exists(quant_noise_desc_path):
+                    raise FileNotFoundError(f"Quantization description file not found: {quant_noise_desc_path}")
+                logging.info(f"Enabled quant, trying to load quantized noise DiT model from {quant_dit_path}...")
                 from mindiesd import quantize
                 quantize(
                     model=self.low_noise_model,
-                    quant_des_path=quant_low_noise_desc_path,
+                    quant_des_path=quant_noise_desc_path,
                     use_nz=use_nz
                 )
                 logging.info("Load quantized low noise DiT model successfully")
@@ -304,7 +304,8 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
-                 offload_model=True):
+                 offload_model=True,
+                 prof_node=None):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
 
@@ -409,12 +410,18 @@ class WanI2V:
                 img[None].cpu(), size=(h, w), mode='bicubic'
             ).transpose(0, 1),
             torch.zeros(3, F - 1, h, w)], dim=1).to(self.device)
+        
+        if prof_node:
+            prof_node.step()
 
         with VAE_patch_parallel():
             y = self.vae.encode([
                 encode_input
             ])[0]
         y = torch.concat([msk, y])
+    
+        if prof_node:
+            prof_node.step()
 
         @contextmanager
         def noop_no_sync():
@@ -489,10 +496,13 @@ class WanI2V:
             dit_time_list = []
             dit_time_list_str = []
 
+            """
             if sampling_steps >= 4 and self.rank == 0:
                 prof = profiling_sample()
             else:
                 prof = None
+            """
+            prof = None
 
             if offload_model:
                 torch.cuda.empty_cache()
@@ -560,11 +570,20 @@ class WanI2V:
                 self.high_noise_model.cpu()
                 torch.cuda.empty_cache()
 
+            torch.npu.synchronize()
             vae_decode_time = time.time()
+            if prof_node:
+                torch.npu.synchronize()
+                prof_node.step()
             if self.rank < 8:
                 with VAE_patch_parallel():
                     videos = self.vae.decode(x0)
-            torch.cuda.synchronize()
+            
+            if prof_node:
+                torch.npu.synchronize()
+                prof_node.step()
+
+            torch.npu.synchronize()
             vae_decode_time = time.time() - vae_decode_time
 
         del noise, latent, x0

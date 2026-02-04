@@ -31,6 +31,8 @@ from wan.distributed.tp_applicator import TensorParallelApplicator
 
 from mindiesd import CacheConfig, CacheAgent
 
+from wan.utils.utils import profiling_sample
+
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
         "prompt":
@@ -762,6 +764,8 @@ def generate(args):
                 block.cache = cache_low
                 block.args = args
 
+        # prof = profiling_sample()
+
         logging.info("Warm up 2 steps ...")
         video = wan_i2v.generate(
             args.prompt,
@@ -774,6 +778,9 @@ def generate(args):
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
             offload_model=args.offload_model)
+        
+        # if prof:
+        #     prof.step()
 
         logging.info("Generating video ...")
         stream.synchronize()
@@ -788,7 +795,12 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model)
+            offload_model=args.offload_model,
+            prof_node=None)
+        
+        # if prof:
+        #     prof.step()
+    
         stream.synchronize()
         end = time.time()
         logging.info(f"Generating video used time {end - begin: .4f}s")

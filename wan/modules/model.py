@@ -324,7 +324,7 @@ class WanCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = self.attention(q, k, v, k_lens=context_lens, use_all_head=False)
+        x = self.attention(q, k, v, k_lens=context_lens, use_all_head=True)
 
         # output
         x = x.flatten(2)

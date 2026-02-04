@@ -8,6 +8,8 @@ export model_base=Wan2.2-I2V-A14B-Lightning
 
 export OMP_NUM_THREADS=32
 
+export PRECISION=1
+
 torchrun --nproc_per_node=8 ../generate.py \
 --task i2v-A14B \
 --ckpt_dir ${model_base} \

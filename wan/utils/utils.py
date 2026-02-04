@@ -9,11 +9,55 @@ import imageio
 import torch
 import torchvision
 
-__all__ = ['save_video', 'save_image', 'str2bool']
+from safetensors import safe_open
+
+__all__ = ['save_video', 'save_image', 'str2bool', 'use_cfg', 'load_and_merge_lora_weight_from_safetensors']
 
 
 def use_cfg(cfg_scale:float=1.0, eps:float=1e-6):
     return abs(cfg_scale - 1.0) > eps
+
+def build_lora_names(key, lora_down_key, lora_up_key, is_native_weight):
+    base = "diffusion_model." if is_native_weight else ""
+    lora_down = base + key.replace(".weight", lora_down_key)
+    lora_up = base + key.replace(".weight", lora_up_key)
+    lora_alpha = base + key.replace(".weight", ".alpha")
+    return lora_down, lora_up, lora_alpha
+
+def load_and_merge_lora_weight(
+    model: torch.nn.Module,
+    lora_state_dict: dict,
+    lora_down_key: str=".lora_down.weight",
+    lora_up_key: str=".lora_up.weight"):
+    is_native_weight = any("diffusion_model." in key for key in lora_state_dict)
+    for key, value in model.named_parameters():
+        lora_down_name, lora_up_name, lora_alpha_name = build_lora_names(
+            key, lora_down_key, lora_up_key, is_native_weight
+        )
+        if lora_down_name in lora_state_dict:
+            lora_down = lora_state_dict[lora_down_name]
+            lora_up = lora_state_dict[lora_up_name]
+            lora_alpha = float(lora_state_dict[lora_alpha_name])
+            rank = lora_down.shape[0]
+            scaling_factor = lora_alpha / rank
+            assert lora_up.dtype == torch.float32
+            assert lora_down.dtype == torch.float32
+            delta_W = scaling_factor * torch.matmul(lora_up, lora_down)
+            value.data = value.data + delta_W
+    return model
+
+
+def load_and_merge_lora_weight_from_safetensors(
+    model: torch.nn.Module,
+    lora_weight_path:str,
+    lora_down_key:str=".lora_down.weight",
+    lora_up_key:str=".lora_up.weight"):
+    lora_state_dict = {}
+    with safe_open(lora_weight_path, framework="pt", device="cpu") as f:
+        for key in f.keys():
+            lora_state_dict[key] = f.get_tensor(key)
+    model = load_and_merge_lora_weight(model, lora_state_dict, lora_down_key, lora_up_key)
+    return model
 
 
 def rand_name(length=8, suffix=''):
@@ -169,7 +213,11 @@ def find_quant_config_file(quant_config_path):
 
     if not os.path.exists(quant_config_desc_path):
         quant_config_desc_path = os.path.join(quant_config_path, "quant_model_description_w8a8_mxfp8.json")
-        use_nz = False
+        use_nz = True
+    
+    if not os.path.exists(quant_config_desc_path):
+        quant_config_desc_path = os.path.join(quant_config_path, "quant_model_description.json")
+        use_nz = True
 
     return quant_config_desc_path, use_nz
 
@@ -202,7 +250,7 @@ def profiling_sample():
             with_stack=profiling_python_stack,
             record_shapes=True,
             profile_memory=False,
-            schedule=torch_npu.profiler.schedule(wait=1, warmup=1, active=1, repeat=1, skip_first=0),
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=1, repeat=1, skip_first=0),
             experimental_config=experimental_config,
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profiling_dir)
         )
