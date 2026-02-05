@@ -27,10 +27,11 @@ export PROFILING_DIR=PROF_A5_F61_BF16_FAQ_720P_DiT_WAN22I2V_L1
 torchrun --nproc_per_node=4 ../generate.py \
 --task i2v-A14B \
 --ckpt_dir ${model_base} \
---size 768*432 \
---frame_num 57 \
---sample_steps 20 \
---sample_guide_scale 5.0 \
+--size 1280*720 \
+--frame_num 61 \
+--sample_steps 4 \
+--cfg_size 1 \
+--sample_guide_scale 1.0 \
 --ulysses_size 4 \
 --sample_solver euler \
 --image ../examples/i2v_input.JPG \
