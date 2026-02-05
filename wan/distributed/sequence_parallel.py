@@ -17,6 +17,8 @@ from mindiesd import rotary_position_embedding
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
     pad_size = target_len - seq_len
+    if pad_size == 0:
+        return original_tensor
     padding_tensor = torch.ones(
         pad_size,
         s1,

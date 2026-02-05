@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+import torch_npu
+
 __all__ = [
     'Wan2_1_VAE',
 ]
@@ -20,19 +22,36 @@ class CausalConv3d(nn.Conv3d):
     """
 
     def __init__(self, *args, **kwargs):
+        """
         super().__init__(*args, **kwargs)
         self._padding = (0, 0, 0,
                          0, 2 * self.padding[0], 0)
         self.padding = (0, self.padding[1], self.padding[2])
+        """
+        super().__init__(*args, **kwargs)
+        pT, pH, pW = self.padding
+
+        self.padding = (0, pH, pW)
+        self.left_pad_t = 2 * pT
 
     def forward(self, x, cache_x=None):
-        padding = list(self._padding)
-        if cache_x is not None and self._padding[4] > 0:
-            cache_x = cache_x.to(x.device)
-            x = torch.cat([cache_x, x], dim=2)
-            padding[4] -= cache_x.shape[2]
-        x = F.pad(x, padding)
+        B, C, T, H, W = x.shape
 
+        if cache_x is not None and cache_x.numel() > 0:
+            cache_x = cache_x.to(device=x.device, dtype=x.dtype, non_blocking=True)
+            Tc = cache_x.shape[2]
+
+            x2 = torch.empty((B, C, Tc + T, H, W), device=x.device, dtype=x.dtype)
+            x2[:, :, :Tc].copy_(cache_x)
+            x2[:, :, Tc:].copy_(x)
+            x = x2
+            pad_t = max(self.left_pad_t - Tc, 0)
+        else:
+            pad_t = self.left_pad_t
+        
+        if pad_t > 0:
+            x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
+        
         return super().forward(x)
 
 
@@ -46,13 +65,22 @@ class RMS_norm(nn.Module):
         self.channel_first = channel_first
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
+        # self.gamma_rmsnorm = self.gamma.to(torch.bfloat16).transpose(0, -1).reshape(-1)
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.
+        self.gamma_rmsnorm = None
 
     def forward(self, x):
+        """
         out = F.normalize(
             x, dim=(1 if self.channel_first else
                     -1)) * self.scale * self.gamma
         return out.to(torch.bfloat16)
+        """
+        x = x.transpose(1, -1)
+        if self.gamma_rmsnorm is None:
+            self.gamma_rmsnorm = self.gamma.to(torch.bfloat16).transpose(0, -1).reshape(-1)
+        x_out = torch_npu.npu_rms_norm(x, self.gamma_rmsnorm, epsilon=1e-06)[0]
+        return x_out.transpose(1, -1)
 
 
 class Upsample(nn.Upsample):
