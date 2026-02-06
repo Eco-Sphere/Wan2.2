@@ -144,8 +144,11 @@ def sp_dit_forward(
         t_idx=t_idx,
     )
 
+    block_idx = 0
     for block in self.blocks:
+        kwargs['block_idx'] = block_idx
         x = block(x, **kwargs)
+        block_idx += 1
 
     # head
     x = self.head(x, e)

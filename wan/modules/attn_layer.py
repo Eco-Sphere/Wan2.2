@@ -22,6 +22,60 @@ logger = logging.getLogger(__name__)
 MAX_TOKEN = 2147483647
 stream = torch.npu.Stream(torch.device(f"cuda:{os.getenv('LOCAL_RANK', 0)}"))
 
+from msmodelslim.processor.quarot.common.quarot_utils import create_rot, QuaRotMode
+from mindiesd.layers.quant.block_quant import fa_block_quant_preprocess
+
+class FP8RotateQuantFA(torch.nn.Module):
+    def __init__(self, prefix=None, weights=None):
+        super().__init__()
+
+        rot_matrix = create_rot(QuaRotMode.HADAMARD, 128, seed=425500)
+        self.register_buffer("rot_matrix", rot_matrix, persistent=False)
+
+    def preprocess(self, query, key):
+        query = torch.matmul(query, self.rot_matrix)
+        key = torch.matmul(key, self.rot_matrix)
+        return query, key
+
+    def forward(self, query, key, value, **kwargs):
+        layout = kwargs.get("layout", "BNSD")
+
+        if 'enable_preprocess' not in kwargs or not kwargs['enable_preprocess']:
+            query, key = self.preprocess(query, key)
+    
+        q, q_scale = fa_block_quant_preprocess(query, block_size=128,
+                                               dst_type=torch_npu.float8_e4m3fn, layout=layout)
+        k, k_scale = fa_block_quant_preprocess(key, block_size=256,
+                                               dst_type=torch_npu.float8_e4m3fn, layout=layout)
+        v, v_scale = fa_block_quant_preprocess(value, block_size=256,
+                                               dst_type=torch_npu.float8_e4m3fn, layout=layout)
+
+        if layout == "BNSD":
+            _, n, s, d = query.shape
+        elif layout == "BSND":
+            _, s, n, d = query.shape
+    
+        x = torch_npu.npu_fused_infer_attention_score_v2(q, k, v, input_layout=layout,
+                                                            num_query_heads=n,
+                                                            softmax_scale=1.0 / math.sqrt(d),
+                                                            pre_tokens=2147483647,
+                                                            next_tokens=2147483647, 
+                                                            query_quant_mode=7,
+                                                            key_quant_mode=7,
+                                                            value_quant_mode=7,
+                                                            dequant_scale_query=q_scale,
+                                                            dequant_scale_key=k_scale,
+                                                            dequant_scale_value=v_scale,
+                                                            out_dtype=query.dtype
+                                                            )[0]
+        
+        if x.shape[2] != s:
+            if layout == "BNSD":
+                x = x[:, :, :s, :]
+            elif layout == "BSND":
+                x = x[:, :s, :, :]
+
+        return x
 
 class xFuserLongContextAttention(LongContextAttention):
     ring_impl_type_supported_kv_cache = ["basic"]
@@ -104,6 +158,10 @@ class xFuserLongContextAttention(LongContextAttention):
             for i in range(event_nums):
                 self.event.append(torch.npu.Event())
                 self.event_begin.append(torch.npu.Event())
+        
+        if self.algo == 3 and not fa_quant:
+            self.fa_quant = FP8RotateQuantFA().to('npu')
+
 
     def forward(
         self,
@@ -290,10 +348,8 @@ class xFuserLongContextAttention(LongContextAttention):
                 value_layer_list = value_layer.split(1, dim=2)
                 output = []
                 for_loop = query_layer.shape[2]
-                if scale is None:
-                    scale = query.shape[-1] ** -0.5
                 for i in range(for_loop):
-                    if self.algo == 0:
+                    if self.algo == 0 or (t_idx < 1 and kwargs['block_idx'] < 20):
                         out = attention_forward(query_layer_list[i], key_layer_list[i], value_layer_list[i],
                                             opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
                     elif self.algo == 1:
@@ -303,6 +359,8 @@ class xFuserLongContextAttention(LongContextAttention):
                         if hasattr(self, 'fa_quant'):
                             out = self.fa_quant(query_layer_list[i].transpose(1,2), key_layer_list[i].transpose(1,2), value_layer_list[i].transpose(1,2), layout="BNSD")
                         else:
+                            if scale is None:
+                                scale = query.shape[-1] ** -0.5
                             out = torch_npu.npu_fused_infer_attention_score(query_layer_list[i].transpose(1,2), key_layer_list[i].transpose(1,2), value_layer_list[i].transpose(1,2),
                                 num_heads = 1, input_layout = "BNSD", scale = scale, pre_tokens=2147483647, next_tokens=2147483647)[0]
                         out = out.transpose(1,2)
