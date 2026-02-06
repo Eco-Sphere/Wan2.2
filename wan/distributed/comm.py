@@ -4,7 +4,7 @@ import torch.distributed as dist
 
 
 def all_to_all_4D(
-        input_: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False
+        input_: torch.tensor, scatter_idx: int = 2, gather_idx: int = 1, group=None, use_sync: bool = False, async_op=False
 ) -> torch.tensor:
     """
     all-to-all for QKV
@@ -44,7 +44,11 @@ def all_to_all_4D(
         # (P, seq_len/P, bs, hc/P, hs) scatter seqlen -all2all-> (P, seq_len/P, bs, hc/P, hs) scatter head
 
         if seq_world_size > 1:
-            dist.all_to_all_single(output, input_t, group=group)
+            if async_op:
+                async_handler = dist.all_to_all_single(output, input_t, group=group, async_op=async_op)
+                return output, async_handler
+            else:
+                dist.all_to_all_single(output, input_t, group=group)
             if use_sync:
                 torch.npu.synchronize()
         else:
