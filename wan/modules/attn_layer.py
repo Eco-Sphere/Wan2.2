@@ -184,6 +184,7 @@ class xFuserLongContextAttention(LongContextAttention):
         joint_strategy="none",
         scale=None,
         t_idx=-1,
+        **kwargs
     ) -> Tensor:
         """forward
 
@@ -293,9 +294,10 @@ class xFuserLongContextAttention(LongContextAttention):
             output = torch.cat(output_res, dim=2)
 
         else:
-            query = all_to_all_4D(input_=query, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
-            key = all_to_all_4D(input_=key, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
-            value = all_to_all_4D(input_=value, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
+            if 'async_op' not in kwargs or not kwargs['async_op']:
+                query = all_to_all_4D(input_=query, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
+                key = all_to_all_4D(input_=key, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
+                value = all_to_all_4D(input_=value, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
 
             if get_sp_group().ring_world_size > 1:
                 ring_size = get_sp_group().ring_world_size

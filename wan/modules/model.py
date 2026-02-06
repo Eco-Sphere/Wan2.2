@@ -385,6 +385,7 @@ class WanAttentionBlock(nn.Module):
         context_lens,
         rainfusion_config,
         t_idx,
+        **kwargs
     ):
         r"""
         Args:
@@ -407,7 +408,8 @@ class WanAttentionBlock(nn.Module):
                 freqs,
                 self.args,
                 rainfusion_config=rainfusion_config,
-                t_idx=t_idx
+                t_idx=t_idx,
+                **kwargs
         )
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             x = x + y * e[2].squeeze(2)

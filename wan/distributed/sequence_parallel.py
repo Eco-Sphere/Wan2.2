@@ -13,6 +13,11 @@ from ..modules.model import sinusoidal_embedding_1d
 from wan.utils.rainfusion import Rainfusion
 from mindiesd import rotary_position_embedding
 
+import torch.distributed as dist
+from .comm import all_to_all_4D
+
+import os
+
 
 def pad_freqs(original_tensor, target_len):
     seq_len, s1, s2 = original_tensor.shape
@@ -160,8 +165,43 @@ def sp_dit_forward(
     x = self.unpatchify(x, grid_sizes)
     return [u.float() for u in x]
 
+def proj_alltoall(x, proj_func, grid_sizes, freqs, shape, async_op=True, norm_func=None):
+    b, s, n, d = shape
+    _input = None
 
-def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, args, dtype=torch.bfloat16, rainfusion_config=None, t_idx=None):
+    # QK
+    if norm_func:
+        _input = norm_func(proj_func(x)).view(b, s, n, d)
+        _input = rope_apply(_input, grid_sizes, freqs)
+    # V
+    else:
+        _input = proj_func(x).view(b, s, n, d)
+
+    ulysses_pg = get_sp_group().ulysses_group
+    seq_world_size = dist.get_world_size(ulysses_pg)
+    bs, shard_seqlen, hc, hs = _input.shape
+    seqlen = shard_seqlen * seq_world_size
+    shard_hc = hc // seq_world_size
+
+    if async_op:
+        output, async_handler = all_to_all_4D(input_=_input, scatter_idx=2, gather_idx=1, group=ulysses_pg, async_op=async_op)
+    else:
+        output = all_to_all_4D(input_=_input, scatter_idx=2, gather_idx=1, group=ulysses_pg, async_op=async_op)
+    def wait():
+        nonlocal output, async_handler, async_op, seqlen, bs, shard_hc, hs
+        if async_op:
+            async_handler.wait()
+            # if scattering the seq-dim, transpose the heads back to the original dimension
+            output = output.reshape(seqlen, bs, shard_hc, hs)
+
+            # (seq_len, bs, hc/P, hs) -reshape-> (bs, seq_len, hc/P, hs)
+            output = output.transpose(0, 1).contiguous().reshape(bs, seqlen, shard_hc, hs)
+
+        return output
+    
+    return wait
+
+def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, args, dtype=torch.bfloat16, rainfusion_config=None, t_idx=None, **kwargs):
     b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
     half_dtypes = (torch.float16, torch.bfloat16)
 
@@ -169,15 +209,26 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, args, dtype=torch.bflo
         return x if x.dtype in half_dtypes else x.to(dtype)
 
     # query, key, value function
-    def qkv_fn(x):
-        q = self.norm_q(self.q(x)).view(b, s, n, d)
-        k = self.norm_k(self.k(x)).view(b, s, n, d)
-        v = self.v(x).view(b, s, n, d)
-        return q, k, v
+    async_op = int(os.getenv("ENABLE_ASYNC_QKV", 0))
+    if not async_op:
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+            return q, k, v
 
-    q, k, v = qkv_fn(x)
-    q = rope_apply(q, grid_sizes, freqs)
-    k = rope_apply(k, grid_sizes, freqs)
+        q, k, v = qkv_fn(x)
+        q = rope_apply(q, grid_sizes, freqs)
+        k = rope_apply(k, grid_sizes, freqs)
+    else:
+        q = proj_alltoall(x, self.q, grid_sizes=grid_sizes, freqs=freqs, shape=(b, s, n, d), norm_func=self.norm_q, async_op=async_op)
+        k = proj_alltoall(x, self.k, grid_sizes=grid_sizes, freqs=freqs, shape=(b, s, n, d), norm_func=self.norm_k, async_op=async_op)
+        q = q()
+        v = proj_alltoall(x, self.v, grid_sizes=grid_sizes, freqs=freqs, shape=(b, s, n, d), async_op=async_op)
+        k = k()
+        v = v()
+
+    kwargs['async_op'] = async_op
 
     x = xFuserLongContextAttention(args, rainfusion_config=rainfusion_config, fa_quant=getattr(self, 'fa_quant', None))(
         None,
@@ -187,6 +238,7 @@ def sp_attn_forward(self, x, seq_lens, grid_sizes, freqs, args, dtype=torch.bflo
         seq_lens=seq_lens,
         window_size=self.window_size,
         t_idx=t_idx,
+        **kwargs
     )
 
     # output
