@@ -345,7 +345,7 @@ class WanI2V:
                 - W: Frame width from max_area)
         """
         torch.npu.synchronize()
-        preprocess_time = time.time()
+        prepare_time = time.time()
 
         # preprocess
         guide_scale = (guide_scale, guide_scale) if isinstance(
@@ -410,7 +410,12 @@ class WanI2V:
                 img[None].cpu(), size=(h, w), mode='bicubic'
             ).transpose(0, 1),
             torch.zeros(3, F - 1, h, w)], dim=1).to(self.device)
+
+        torch.npu.synchronize()
+        prepare_time = time.time() - prepare_time
+        vae_encode_time = time.time()
         
+
         if prof_node:
             prof_node.step()
 
@@ -419,6 +424,10 @@ class WanI2V:
                 encode_input
             ])[0]
         y = torch.concat([msk, y])
+
+        torch.npu.synchronize()
+        preprocess_time = time.time()
+        vae_encode_time = time.time() - vae_encode_time
     
         if prof_node:
             prof_node.step()
@@ -496,12 +505,12 @@ class WanI2V:
             dit_time_list = []
             dit_time_list_str = []
 
-            """
-            if sampling_steps >= 4 and self.rank == 0:
-                prof = profiling_sample()
-            else:
-                prof = None
-            """
+            # """
+            # if sampling_steps >= 4 and self.rank == 0:
+            #     prof = profiling_sample()
+            # else:
+            #     prof = None
+            # """
             prof = None
 
             if offload_model:
@@ -603,9 +612,11 @@ class WanI2V:
             dist.barrier()
 
         logging.info(f"===============================")
+        logging.info(f"Prepare time: {prepare_time:.2f}s")
+        logging.info(f"VAE Encode time: {vae_encode_time:.2f}s")
         logging.info(f"Preprocess time: {preprocess_time:.2f}")
         logging.info(f"Dit time list: {dit_time_list_str}")
-        logging.info(f"Dit E2E Time: {sum(dit_time_list):.2f}")
+        logging.info(f"Dit E2E Time: {sum(dit_time_list):.2f}s")
         logging.info(f"VAE decode time: {vae_decode_time:.2f}s")
         logging.info(f"===============================")
         return videos[0] if self.rank == 0 else None
