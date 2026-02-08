@@ -33,8 +33,19 @@ class FP8RotateQuantFA(torch.nn.Module):
         self.register_buffer("rot_matrix", rot_matrix, persistent=False)
 
     def preprocess(self, query, key):
+        # query = query - query.mean(dim=1, keepdim=True)
         query = torch.matmul(query, self.rot_matrix)
         key = torch.matmul(key, self.rot_matrix)
+        # key = key - key.mean(dim=2, keepdim=True)
+        # alpha = 0.8
+        # # print(f"Before QUERY SHAPE: {query.shape}")
+        # q_smooth = query.max(dim=3, keepdim=True).values.clamp(min=1e-5)
+        # k_smooth = key.max(dim=3, keepdim=True).values.clamp(min=1e-5)
+        # # scales = (q_smooth.pow(alpha) / k_smooth.pow(1 - alpha)).clamp(min=1e-5)
+        # scales = q_smooth.pow(0.5).clamp(min=1e-5)
+        # query = query / scales
+        # key = key * scales
+        # print(f"After QUERY SHAPE: {query.shape}")
         return query, key
 
     def forward(self, query, key, value, **kwargs):
@@ -49,6 +60,10 @@ class FP8RotateQuantFA(torch.nn.Module):
                                                dst_type=torch_npu.float8_e4m3fn, layout=layout)
         v, v_scale = fa_block_quant_preprocess(value, block_size=256,
                                                dst_type=torch_npu.float8_e4m3fn, layout=layout)
+
+        # print(f"q shape: {q.shape} | q dtype: {q.dtype} | scale shape: {q_scale.shape} | scale dtype: {q_scale.dtype}")
+        # print(f"k shape: {k.shape} | k dtype: {k.dtype} | scale shape: {k_scale.shape} | scale dtype: {k_scale.dtype}")
+        # print(f"v shape: {v.shape} | v dtype: {v.dtype} | scale shape: {v_scale.shape} | scale dtype: {v_scale.dtype}")
 
         if layout == "BNSD":
             _, n, s, d = query.shape
@@ -162,6 +177,7 @@ class xFuserLongContextAttention(LongContextAttention):
         if self.algo == 3 and not fa_quant:
             self.fa_quant = FP8RotateQuantFA().to('npu')
 
+        # self.bubble_tensor = torch.ones((800, 10240), dtype=torch.bfloat16, device='npu')
 
     def forward(
         self,
@@ -294,7 +310,7 @@ class xFuserLongContextAttention(LongContextAttention):
             output = torch.cat(output_res, dim=2)
 
         else:
-            if 'async_op' not in kwargs or not kwargs['async_op']:
+            if not kwargs['async_op']:
                 query = all_to_all_4D(input_=query, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
                 key = all_to_all_4D(input_=key, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
                 value = all_to_all_4D(input_=value, scatter_idx=2, gather_idx=1, group=self.ulysses_pg)
@@ -351,7 +367,11 @@ class xFuserLongContextAttention(LongContextAttention):
                 output = []
                 for_loop = query_layer.shape[2]
                 for i in range(for_loop):
-                    if self.algo == 0 or (t_idx < 1 and kwargs['block_idx'] < 20):
+                    if (
+                        self.algo == 0
+                        or (t_idx in [0] and kwargs['block_idx'] in [0, 1, 2, 3, 4, 5, 7, 10])
+                        # or (t_idx in [2] and kwargs['block_idx'] in [0,17,19,22])
+                    ):
                         out = attention_forward(query_layer_list[i], key_layer_list[i], value_layer_list[i],
                                             opt_mode="manual", op_type="fused_attn_score", layout="BNSD")
                     elif self.algo == 1:
@@ -368,6 +388,8 @@ class xFuserLongContextAttention(LongContextAttention):
                         out = out.transpose(1,2)
                     else:
                         raise ValueError(f"select flash attention algorithm only support 0, 1, 3, but got f{self.algo}")
+                    
+                    # _, _ = torch_npu.npu_dynamic_quant(self.bubble_tensor, dst_type=torch.int8)
 
                     output.append(out)
                 out = torch.cat(output, dim=2)

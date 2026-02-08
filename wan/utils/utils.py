@@ -238,6 +238,13 @@ def profiling_sample():
         logging.info(f"Profiling python stack: {profiling_python_stack}")
         logging.info(f"Profiling dir: {profiling_dir}")
 
+        # experimental_config = torch_npu.profiler._ExperimentalConfig(
+        #     export_type=torch_npu.profiler.ExportType.Text,
+        #     aic_metrics=torch_npu.profiler.AiCMetrics.L2Cache,
+        #     profiler_level=profiling_level,
+        #     data_simplification=False,
+        #     l2_cache=True,
+        # )
         experimental_config = torch_npu.profiler._ExperimentalConfig(
             export_type=torch_npu.profiler.ExportType.Text,
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
